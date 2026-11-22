@@ -48,8 +48,23 @@ local QUEUE_RESPAWN_HANDLER = false
 local isRejoining = false
 local objectSelection = nil
 
+local function getLocalPlayer()
+	if player and player.Parent then
+		return player
+	end
+	player = Players.LocalPlayer
+	while not player do
+		player = Players.LocalPlayer
+		if not player then
+			task.wait(0.1)
+		end
+	end
+	return player
+end
+
 local function getCharacter()
-	return player.Character
+	local lp = getLocalPlayer()
+	return lp.Character
 end
 
 local function getRoot()
@@ -90,6 +105,7 @@ local function rejoinSameServer(queueHandler)
 	end
 	isRejoining = true
 
+	local lp = getLocalPlayer()
 	local placeId = game.PlaceId
 	local jobId = game.JobId
 	local character = getCharacter()
@@ -122,11 +138,11 @@ local function rejoinSameServer(queueHandler)
 	end
 
 	if #Players:GetPlayers() <= 1 or jobId == "" then
-		player:Kick("\nRejoining...")
+		lp:Kick("\nRejoining...")
 		task.wait(0.3)
-		TeleportService:Teleport(placeId, player, data)
+		TeleportService:Teleport(placeId, lp, data)
 	else
-		TeleportService:TeleportToPlaceInstance(placeId, jobId, player, nil, data)
+		TeleportService:TeleportToPlaceInstance(placeId, jobId, lp, nil, data)
 	end
 end
 
@@ -157,25 +173,27 @@ local function waitForGameAndPlayerLoaded()
 		game.Loaded:Wait()
 	end
 
-	if not player.Character then
-		player.CharacterAdded:Wait()
-	end
-
-	local character = getCharacter()
-	while not character or not character.Parent do
+	local lp = getLocalPlayer()
+	while not lp.Character or not lp.Character.Parent do
+		lp.CharacterAdded:Wait()
 		task.wait(0.1)
-		character = getCharacter()
 	end
 
+	local character = lp.Character
 	local humanoid = character:FindFirstChildOfClass("Humanoid") or character:WaitForChild("Humanoid", 30)
 	local root = character:FindFirstChild("HumanoidRootPart") or character:WaitForChild("HumanoidRootPart", 30)
 
-	while humanoid and humanoid.Health <= 0 do
+	while not humanoid or not root or humanoid.Health <= 0 do
 		task.wait(0.1)
-	end
-
-	if not root then
-		character:WaitForChild("HumanoidRootPart")
+		character = lp.Character
+		if not character or not character.Parent then
+			lp.CharacterAdded:Wait()
+			character = lp.Character
+		end
+		if character then
+			humanoid = humanoid or character:FindFirstChildOfClass("Humanoid")
+			root = root or character:FindFirstChild("HumanoidRootPart")
+		end
 	end
 
 	objectSelection = Workspace:WaitForChild("ObjectSelection")
@@ -187,6 +205,7 @@ local function waitForGameAndPlayerLoaded()
 end
 
 local function bindDeathRejoin()
+	local lp = getLocalPlayer()
 	local function hookCharacter(char)
 		if not char then
 			return
@@ -199,8 +218,8 @@ local function bindDeathRejoin()
 		end
 	end
 
-	hookCharacter(player.Character)
-	player.CharacterAdded:Connect(hookCharacter)
+	hookCharacter(lp.Character)
+	lp.CharacterAdded:Connect(hookCharacter)
 end
 
 local function getInstancePosition(target)
@@ -620,7 +639,8 @@ local function fireVentTouchAndPrompt()
 end
 
 local function getCashAmountLabel()
-	local playerGui = player:FindFirstChild("PlayerGui")
+	local lp = getLocalPlayer()
+	local playerGui = lp:FindFirstChild("PlayerGui")
 	local mainGui = playerGui and playerGui:FindFirstChild("MainGUI")
 	local statsHud = mainGui and mainGui:FindFirstChild("StatsHUD")
 	local cashBagHud = statsHud and statsHud:FindFirstChild("CashBagHUD")
