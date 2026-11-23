@@ -10,13 +10,16 @@ local Workspace = game:GetService("Workspace")
 local player = Players.LocalPlayer
 
 local VENT_DESTINATION = Vector3.new(-77, 120, 813)
+local CLUB_DESTINATION = Vector3.new(1328, 146, -127)
 local BOX_TWEEN_SPEED = 75
 local BOX_Y_OFFSET = -6
 local FIRES_PER_BOX = 3
 local VENT_WAIT_SECONDS = 4
-local TARGET_CASH_TEXT = "$5000"
+local COLLECT_WAIT_SECONDS = 1.5
+local JEWEL_TARGET_CASH = "$5000"
+local CLUB_TARGET_CASH = "$6000"
 local MAX_FARM_SECONDS = 120
-local FINAL_CFRAME = CFrame.new(2024, 26, 422)
+local FINAL_CFRAME = CFrame.new(2137, 26, 363)
 local REJOIN_DELAY_SECONDS = 0.5
 local QUEUE_RESPAWN_HANDLER = false
 
@@ -58,14 +61,28 @@ local function hasOtherPlayers()
 	return #Players:GetPlayers() > 1
 end
 
-local function isJewelLocked()
+local function getHeistLockedValue(heistName)
 	local heistStatus = ReplicatedStorage:FindFirstChild("HeistStatus")
-	local jewel = heistStatus and heistStatus:FindFirstChild("Jewel")
-	local locked = jewel and jewel:FindFirstChild("Locked")
+	local heist = heistStatus and heistStatus:FindFirstChild(heistName)
+	local locked = heist and heist:FindFirstChild("Locked")
 	if locked and locked:IsA("BoolValue") then
-		return locked.Value == true
+		return locked
 	end
-	return false
+	return nil
+end
+
+local function isJewelLocked()
+	local locked = getHeistLockedValue("Jewel")
+	return locked and locked.Value == true or false
+end
+
+local function isClubLocked()
+	local locked = getHeistLockedValue("Club")
+	-- Must be explicitly false; treat missing or true as locked/unavailable
+	if not locked then
+		return true
+	end
+	return locked.Value ~= false
 end
 
 local function isPlayerDead()
@@ -136,16 +153,16 @@ local function rejoinSameServer(queueHandler)
 	end
 end
 
-local function guardJewelUnlocked()
-	if isJewelLocked() then
+local function guardHeistCondition(failConditionFn)
+	if failConditionFn() then
 		rejoinSameServer(QUEUE_RESPAWN_HANDLER)
 		return false
 	end
 	return true
 end
 
-local function guardSoloServer()
-	if not guardJewelUnlocked() then
+local function guardSoloServer(failConditionFn)
+	if failConditionFn and not guardHeistCondition(failConditionFn) then
 		return false
 	end
 
@@ -159,13 +176,13 @@ local function guardSoloServer()
 	end
 
 	while hasOtherPlayers() and not isPlayerDead() do
-		if not guardJewelUnlocked() then
+		if failConditionFn and not guardHeistCondition(failConditionFn) then
 			return false
 		end
 		task.wait(0.25)
 	end
 
-	if not guardJewelUnlocked() then
+	if failConditionFn and not guardHeistCondition(failConditionFn) then
 		return false
 	end
 
@@ -265,7 +282,11 @@ local function setTeamToCriminals()
 	return true
 end
 
-local function waitForRespawnAfterTeamSwitch(previousCharacter)
+local function switchToCriminalsAndRespawn()
+	local previousCharacter = getCharacter()
+	isSwitchingTeam = true
+	setTeamToCriminals()
+
 	local lp = getLocalPlayer()
 	local deadline = os.clock() + 20
 	local newChar = lp.Character
@@ -286,6 +307,7 @@ local function waitForRespawnAfterTeamSwitch(previousCharacter)
 			local hum = newChar:FindFirstChildOfClass("Humanoid")
 			local root = newChar:FindFirstChild("HumanoidRootPart")
 			if hum and root and hum.Health > 0 then
+				isSwitchingTeam = false
 				bindDeathRejoin()
 				return newChar
 			end
@@ -293,6 +315,7 @@ local function waitForRespawnAfterTeamSwitch(previousCharacter)
 		task.wait(0.05)
 	end
 
+	isSwitchingTeam = false
 	bindDeathRejoin()
 	return lp.Character
 end
@@ -330,8 +353,8 @@ local function setCharacterNoclip(enabled)
 	end
 end
 
-local function tweenCharacterToPosition(destination, speed)
-	if not guardSoloServer() then
+local function tweenCharacterToPosition(destination, speed, failConditionFn)
+	if not guardSoloServer(failConditionFn) then
 		return false
 	end
 
@@ -359,7 +382,7 @@ local function tweenCharacterToPosition(destination, speed)
 
 	local paused = false
 	local conn = proxy.Changed:Connect(function(newCFrame)
-		if isJewelLocked() or isPlayerDead() then
+		if (failConditionFn and failConditionFn()) or isPlayerDead() then
 			rejoinSameServer(QUEUE_RESPAWN_HANDLER)
 			return
 		end
@@ -384,7 +407,7 @@ local function tweenCharacterToPosition(destination, speed)
 
 	tween:Play()
 	while tween.PlaybackState == Enum.PlaybackState.Playing do
-		if isJewelLocked() or isPlayerDead() then
+		if (failConditionFn and failConditionFn()) or isPlayerDead() then
 			tween:Cancel()
 			conn:Disconnect()
 			proxy:Destroy()
@@ -394,10 +417,10 @@ local function tweenCharacterToPosition(destination, speed)
 
 		if hasOtherPlayers() then
 			tween:Pause()
-			while hasOtherPlayers() and not isPlayerDead() and not isJewelLocked() do
+			while hasOtherPlayers() and not isPlayerDead() and not (failConditionFn and failConditionFn()) do
 				task.wait(0.2)
 			end
-			if isJewelLocked() or isPlayerDead() then
+			if (failConditionFn and failConditionFn()) or isPlayerDead() then
 				tween:Cancel()
 				conn:Disconnect()
 				proxy:Destroy()
@@ -412,7 +435,7 @@ local function tweenCharacterToPosition(destination, speed)
 
 	conn:Disconnect()
 	proxy:Destroy()
-	return not paused and not isPlayerDead() and not isJewelLocked()
+	return not paused and not isPlayerDead() and not (failConditionFn and failConditionFn())
 end
 
 local function findProximityPrompt(container)
@@ -423,7 +446,7 @@ local function findProximityPrompt(container)
 end
 
 local function fireVentTouchAndPrompt()
-	if not guardSoloServer() then
+	if not guardSoloServer(isJewelLocked) then
 		return false
 	end
 
@@ -483,13 +506,13 @@ local function getCashAmountLabel()
 	return cash and cash:FindFirstChild("Amount")
 end
 
-local function hasReachedTargetCash()
+local function hasReachedCashTarget(targetText)
 	local label = getCashAmountLabel()
 	if not label or not label:IsA("TextLabel") then
 		return false
 	end
 
-	return string.gsub(label.Text, "%s+", "") == TARGET_CASH_TEXT
+	return string.gsub(label.Text, "%s+", "") == targetText
 end
 
 local function isJewelryBox(instance, jewelryBoxesFolder)
@@ -544,7 +567,7 @@ local function findNextBoxToTween(boxes, currentIndex)
 end
 
 local function runJewelryBoxFarmUntilTargetCash()
-	if not guardJewelUnlocked() then
+	if not guardHeistCondition(isJewelLocked) then
 		return false
 	end
 
@@ -568,7 +591,7 @@ local function runJewelryBoxFarmUntilTargetCash()
 		end
 	end)
 
-	while not hasReachedTargetCash() do
+	while not hasReachedCashTarget(JEWEL_TARGET_CASH) do
 		if isJewelLocked() or isPlayerDead() then
 			noclipConn:Disconnect()
 			rejoinSameServer(QUEUE_RESPAWN_HANDLER)
@@ -587,7 +610,7 @@ local function runJewelryBoxFarmUntilTargetCash()
 		end
 
 		if MAX_FARM_SECONDS and (os.clock() - startClock) >= MAX_FARM_SECONDS then
-			warn("Reached MAX_FARM_SECONDS before hitting " .. TARGET_CASH_TEXT)
+			warn("Reached MAX_FARM_SECONDS before hitting " .. JEWEL_TARGET_CASH)
 			break
 		end
 
@@ -598,8 +621,8 @@ local function runJewelryBoxFarmUntilTargetCash()
 		targetBox, nextIndex = findNextBoxToTween(boxes, nextIndex)
 		if targetBox then
 			local boxPos = getInstancePosition(targetBox)
-			if boxPos and guardSoloServer() then
-				tweenCharacterToPosition(boxPos + Vector3.new(0, BOX_Y_OFFSET, 0), BOX_TWEEN_SPEED)
+			if boxPos and guardSoloServer(isJewelLocked) then
+				tweenCharacterToPosition(boxPos + Vector3.new(0, BOX_Y_OFFSET, 0), BOX_TWEEN_SPEED, isJewelLocked)
 			end
 		end
 
@@ -609,7 +632,7 @@ local function runJewelryBoxFarmUntilTargetCash()
 			return false
 		end
 
-		if hasReachedTargetCash() then
+		if hasReachedCashTarget(JEWEL_TARGET_CASH) then
 			break
 		end
 
@@ -625,34 +648,72 @@ local function runJewelryBoxFarmUntilTargetCash()
 	return not isPlayerDead() and not isJewelLocked()
 end
 
-local function teleportToJewelryTop()
-	if not guardSoloServer() then
+local function waitUntilClubCashTarget(targetText)
+	if not guardHeistCondition(isClubLocked) then
+		return false
+	end
+
+	local startClock = os.clock()
+	local noclipConn = RunService.Stepped:Connect(function()
+		if not hasOtherPlayers() and not isPlayerDead() and not isClubLocked() then
+			setCharacterNoclip(true)
+		end
+	end)
+
+	while not hasReachedCashTarget(targetText) do
+		if isClubLocked() or isPlayerDead() then
+			noclipConn:Disconnect()
+			rejoinSameServer(QUEUE_RESPAWN_HANDLER)
+			return false
+		end
+
+		if hasOtherPlayers() then
+			while hasOtherPlayers() and not isPlayerDead() and not isClubLocked() do
+				task.wait(0.25)
+			end
+			if isClubLocked() or isPlayerDead() then
+				noclipConn:Disconnect()
+				rejoinSameServer(QUEUE_RESPAWN_HANDLER)
+				return false
+			end
+		end
+
+		if MAX_FARM_SECONDS and (os.clock() - startClock) >= MAX_FARM_SECONDS then
+			warn("Reached MAX_FARM_SECONDS waiting for " .. targetText)
+			break
+		end
+
+		task.wait(0.2)
+	end
+
+	noclipConn:Disconnect()
+	setCharacterNoclip(false)
+	return not isPlayerDead() and not isClubLocked()
+end
+
+local function pivotCharacterToCFrame(targetCFrame, failConditionFn)
+	if not guardSoloServer(failConditionFn) then
 		return false
 	end
 
 	local character = getCharacter()
 	if not character then
-		warn("Character not found for jewelry top teleport")
+		warn("Character not found for teleport")
 		return false
 	end
 
-	setCharacterNoclip(true)
-	character:PivotTo(CFrame.new(VENT_DESTINATION))
+	character:PivotTo(targetCFrame)
 	return true
 end
 
-local function teleportFinal()
-	if not guardSoloServer() then
-		return false
+local function waitGuardedSeconds(seconds, failConditionFn)
+	local deadline = os.clock() + seconds
+	while os.clock() < deadline do
+		if not guardSoloServer(failConditionFn) then
+			return false
+		end
+		task.wait(0.1)
 	end
-
-	local character = getCharacter()
-	if not character then
-		warn("Character not found for final teleport")
-		return false
-	end
-
-	character:PivotTo(FINAL_CFRAME)
 	return true
 end
 
@@ -660,21 +721,18 @@ local function executeFullSequence()
 	waitForGameAndPlayerLoaded()
 	bindDeathRejoin()
 
-	if not guardSoloServer() then
+	if not guardSoloServer(isJewelLocked) then
 		return
 	end
 
-	local previousCharacter = getCharacter()
-	isSwitchingTeam = true
-	setTeamToCriminals()
-	waitForRespawnAfterTeamSwitch(previousCharacter)
-	isSwitchingTeam = false
-
-	if not guardSoloServer() then
+	-- 1. Switch to Criminals and immediately TP to Jewelry vent top
+	switchToCriminalsAndRespawn()
+	if not guardSoloServer(isJewelLocked) then
 		return
 	end
 
-	if not teleportToJewelryTop() then
+	setCharacterNoclip(true)
+	if not pivotCharacterToCFrame(CFrame.new(VENT_DESTINATION), isJewelLocked) then
 		return
 	end
 
@@ -683,20 +741,52 @@ local function executeFullSequence()
 	end
 
 	setCharacterNoclip(false)
-
-	local waitDeadline = os.clock() + VENT_WAIT_SECONDS
-	while os.clock() < waitDeadline do
-		if not guardSoloServer() then
-			return
-		end
-		task.wait(0.1)
+	if not waitGuardedSeconds(VENT_WAIT_SECONDS, isJewelLocked) then
+		return
 	end
 
+	-- 2. Farm Jewelry until $5000
 	if not runJewelryBoxFarmUntilTargetCash() then
 		return
 	end
 
-	if teleportFinal() and guardSoloServer() then
+	-- 3. Collect Jewelry cash at final position
+	if not pivotCharacterToCFrame(FINAL_CFRAME) then
+		return
+	end
+	if not waitGuardedSeconds(COLLECT_WAIT_SECONDS) then
+		return
+	end
+
+	-- 4. Verify Club is open (Locked == false), switch team, and immediately TP to 1328, 146, -127
+	if not guardSoloServer(isClubLocked) then
+		return
+	end
+
+	switchToCriminalsAndRespawn()
+	if not guardSoloServer(isClubLocked) then
+		return
+	end
+
+	setCharacterNoclip(true)
+	if not pivotCharacterToCFrame(CFrame.new(CLUB_DESTINATION), isClubLocked) then
+		return
+	end
+	setCharacterNoclip(false)
+
+	-- 5. Wait until cash reaches $6000, collect at final position, and rejoin
+	if not waitUntilClubCashTarget(CLUB_TARGET_CASH) then
+		return
+	end
+
+	if not pivotCharacterToCFrame(FINAL_CFRAME) then
+		return
+	end
+	if not waitGuardedSeconds(COLLECT_WAIT_SECONDS) then
+		return
+	end
+
+	if guardSoloServer() then
 		rejoinSameServer(QUEUE_RESPAWN_HANDLER)
 	end
 end
