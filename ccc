@@ -33,6 +33,15 @@ local isRejoining = false
 local isSwitchingTeam = false
 local deathConn = nil
 local charAddedConn = nil
+local currentStepText = "Starting..."
+local stepLabelRef = nil
+
+local function setStepStatus(text)
+	currentStepText = tostring(text)
+	if stepLabelRef and stepLabelRef.Parent then
+		stepLabelRef.Text = "Step: " .. currentStepText
+	end
+end
 
 local function getLocalPlayer()
 	if player and player.Parent then
@@ -132,6 +141,7 @@ local function rejoinSameServer(queueHandler)
 		return
 	end
 	isRejoining = true
+	setStepStatus("Rejoining server...")
 
 	local lp = getLocalPlayer()
 	local placeId = game.PlaceId
@@ -196,6 +206,8 @@ local function guardSoloServer(failConditionFn)
 		return true
 	end
 
+	local prevStep = currentStepText
+	setStepStatus("Waiting (other player in server)")
 	while hasOtherPlayers() and not isPlayerDead() do
 		if failConditionFn and not guardHeistCondition(failConditionFn) then
 			return false
@@ -212,10 +224,12 @@ local function guardSoloServer(failConditionFn)
 		return false
 	end
 
+	setStepStatus(prevStep)
 	return true
 end
 
 local function waitForGameAndPlayerLoaded()
+	setStepStatus("Waiting for game & character...")
 	if not game:IsLoaded() then
 		game.Loaded:Wait()
 	end
@@ -274,6 +288,7 @@ local function bindDeathRejoin()
 		if hum then
 			deathConn = hum.Died:Connect(function()
 				if not isSwitchingTeam then
+					setStepStatus("Died - rejoining...")
 					rejoinSameServer(QUEUE_RESPAWN_HANDLER)
 				end
 			end)
@@ -302,28 +317,38 @@ local function readHudText(pathFn)
 	return "..."
 end
 
-local function createStatsOverlay()
-	local existing = CoreGui:FindFirstChild("HeistStatsOverlay")
-	if existing then
-		existing:Destroy()
-	end
-
-	local gui = Instance.new("ScreenGui")
-	gui.Name = "HeistStatsOverlay"
+local function attachOverlayGui(gui)
 	gui.ResetOnSpawn = false
 	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 
 	local okParent = pcall(function()
 		gui.Parent = CoreGui
 	end)
-	if not okParent then
-		gui.Parent = getLocalPlayer():WaitForChild("PlayerGui")
+	if not okParent or not gui.Parent then
+		local lp = getLocalPlayer()
+		gui.Parent = lp:WaitForChild("PlayerGui")
 	end
+end
+
+local function createStatsOverlay()
+	local existing = CoreGui:FindFirstChild("HeistStatsOverlay")
+	if existing then
+		existing:Destroy()
+	end
+	local lp = getLocalPlayer()
+	local pg = lp:FindFirstChild("PlayerGui")
+	if pg and pg:FindFirstChild("HeistStatsOverlay") then
+		pg.HeistStatsOverlay:Destroy()
+	end
+
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "HeistStatsOverlay"
+	attachOverlayGui(gui)
 
 	local frame = Instance.new("Frame")
 	frame.Name = "Panel"
-	frame.Position = UDim2.new(0, 12, 0.5, -45)
-	frame.Size = UDim2.new(0, 210, 0, 90)
+	frame.Position = UDim2.new(0, 12, 0.5, -56)
+	frame.Size = UDim2.new(0, 235, 0, 112)
 	frame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
 	frame.BackgroundTransparency = 0.2
 	frame.BorderSizePixel = 0
@@ -364,9 +389,16 @@ local function createStatsOverlay()
 	local cashLabel = makeLabel("Cash", 1, Color3.fromRGB(120, 240, 150))
 	local levelLabel = makeLabel("Level", 2, Color3.fromRGB(140, 195, 255))
 	local xpLabel = makeLabel("XP", 3, Color3.fromRGB(235, 210, 125))
+	local stepLabel = makeLabel("Step", 4, Color3.fromRGB(220, 225, 235))
+	stepLabel.Text = "Step: " .. currentStepText
+	stepLabelRef = stepLabel
 
 	task.spawn(function()
-		while gui.Parent do
+		while true do
+			if not gui.Parent then
+				attachOverlayGui(gui)
+			end
+
 			local statsHud = getStatsHud()
 
 			local cashText = readHudText(function()
@@ -382,6 +414,7 @@ local function createStatsOverlay()
 			cashLabel.Text = "Cash: " .. cashText
 			levelLabel.Text = "Level: " .. levelText
 			xpLabel.Text = "XP: " .. xpText
+			stepLabel.Text = "Step: " .. currentStepText
 
 			task.wait(0.25)
 		end
@@ -407,8 +440,9 @@ local function setTeamToCriminals()
 	return true
 end
 
-local function switchToCriminalsAndRespawn()
+local function switchToCriminalsAndRespawn(nextStepLabel)
 	local previousCharacter = getCharacter()
+	setStepStatus("Switching team & respawning...")
 	isSwitchingTeam = true
 	setTeamToCriminals()
 
@@ -434,6 +468,9 @@ local function switchToCriminalsAndRespawn()
 			if hum and root and hum.Health > 0 then
 				isSwitchingTeam = false
 				bindDeathRejoin()
+				if nextStepLabel then
+					setStepStatus(nextStepLabel)
+				end
 				return newChar
 			end
 		end
@@ -442,6 +479,9 @@ local function switchToCriminalsAndRespawn()
 
 	isSwitchingTeam = false
 	bindDeathRejoin()
+	if nextStepLabel then
+		setStepStatus(nextStepLabel)
+	end
 	return lp.Character
 end
 
@@ -575,6 +615,7 @@ local function fireVentTouchAndPrompt()
 		return false
 	end
 
+	setStepStatus("Entering Jewelry vent...")
 	local jewelryStore = Workspace:FindFirstChild("JewelryStore")
 	local vent = jewelryStore and jewelryStore:FindFirstChild("JewelryVent")
 	local trigger = vent and vent:FindFirstChild("Trigger")
@@ -696,6 +737,8 @@ local function runJewelryBoxFarmUntilTargetCash()
 		return false
 	end
 
+	setStepStatus("Robbing Jewelry (" .. JEWEL_TARGET_CASH .. ")")
+
 	local jewelryStore = Workspace:FindFirstChild("JewelryStore")
 	local jewelryBoxesFolder = jewelryStore and jewelryStore:FindFirstChild("JewelryBoxes")
 	local manager = jewelryBoxesFolder and jewelryBoxesFolder:FindFirstChild("JewelryManager")
@@ -724,6 +767,7 @@ local function runJewelryBoxFarmUntilTargetCash()
 		end
 
 		if hasOtherPlayers() then
+			setStepStatus("Waiting (other player in server)")
 			while hasOtherPlayers() and not isPlayerDead() and not isJewelLocked() do
 				task.wait(0.25)
 			end
@@ -732,6 +776,7 @@ local function runJewelryBoxFarmUntilTargetCash()
 				rejoinSameServer(QUEUE_RESPAWN_HANDLER)
 				return false
 			end
+			setStepStatus("Robbing Jewelry (" .. JEWEL_TARGET_CASH .. ")")
 		end
 
 		if MAX_FARM_SECONDS and (os.clock() - startClock) >= MAX_FARM_SECONDS then
@@ -833,6 +878,8 @@ local function runCasinoFarmUntilTargetCash()
 		return false
 	end
 
+	setStepStatus("Robbing Casino (" .. CASINO_TARGET_CASH .. ")")
+
 	local leverEvents = collectCasinoLeverEvents()
 	local deadline = os.clock() + 10
 	while #leverEvents < 4 and os.clock() < deadline do
@@ -862,6 +909,7 @@ local function runCasinoFarmUntilTargetCash()
 		end
 
 		if hasOtherPlayers() then
+			setStepStatus("Waiting (other player in server)")
 			while hasOtherPlayers() and not isPlayerDead() and not isCasinoLocked() do
 				task.wait(0.25)
 			end
@@ -870,6 +918,7 @@ local function runCasinoFarmUntilTargetCash()
 				rejoinSameServer(QUEUE_RESPAWN_HANDLER)
 				return false
 			end
+			setStepStatus("Robbing Casino (" .. CASINO_TARGET_CASH .. ")")
 		end
 
 		if os.clock() >= nextLeverFireClock then
@@ -891,10 +940,13 @@ local function runCasinoFarmUntilTargetCash()
 	return not isPlayerDead() and not isCasinoLocked()
 end
 
-local function waitUntilHeistCashTarget(targetText, failConditionFn)
+local function waitUntilHeistCashTarget(targetText, failConditionFn, robbingStepLabel)
 	if failConditionFn and not guardHeistCondition(failConditionFn) then
 		return false
 	end
+
+	local activeLabel = robbingStepLabel or ("Robbing (" .. targetText .. ")")
+	setStepStatus(activeLabel)
 
 	local startClock = os.clock()
 	local noclipConn = RunService.Stepped:Connect(function()
@@ -911,6 +963,7 @@ local function waitUntilHeistCashTarget(targetText, failConditionFn)
 		end
 
 		if hasOtherPlayers() then
+			setStepStatus("Waiting (other player in server)")
 			while hasOtherPlayers() and not isPlayerDead() and not (failConditionFn and failConditionFn()) do
 				task.wait(0.25)
 			end
@@ -919,6 +972,7 @@ local function waitUntilHeistCashTarget(targetText, failConditionFn)
 				rejoinSameServer(QUEUE_RESPAWN_HANDLER)
 				return false
 			end
+			setStepStatus(activeLabel)
 		end
 
 		if MAX_FARM_SECONDS and (os.clock() - startClock) >= MAX_FARM_SECONDS then
@@ -934,7 +988,11 @@ local function waitUntilHeistCashTarget(targetText, failConditionFn)
 	return not isPlayerDead() and not (failConditionFn and failConditionFn())
 end
 
-local function pivotCharacterToCFrame(targetCFrame, failConditionFn)
+local function pivotCharacterToCFrame(targetCFrame, failConditionFn, stepLabel)
+	if stepLabel then
+		setStepStatus(stepLabel)
+	end
+
 	if not guardSoloServer(failConditionFn) then
 		return false
 	end
@@ -949,7 +1007,11 @@ local function pivotCharacterToCFrame(targetCFrame, failConditionFn)
 	return true
 end
 
-local function waitGuardedSeconds(seconds, failConditionFn)
+local function waitGuardedSeconds(seconds, failConditionFn, waitStepLabel)
+	if waitStepLabel then
+		setStepStatus(waitStepLabel)
+	end
+
 	local deadline = os.clock() + seconds
 	while os.clock() < deadline do
 		if not guardSoloServer(failConditionFn) then
@@ -970,13 +1032,13 @@ local function executeFullSequence()
 	end
 
 	-- 1. Switch to Criminals and immediately TP to Jewelry vent top
-	switchToCriminalsAndRespawn()
+	switchToCriminalsAndRespawn("Teleporting to Jewelry...")
 	if not guardSoloServer(isJewelLocked) then
 		return
 	end
 
 	setCharacterNoclip(true)
-	if not pivotCharacterToCFrame(CFrame.new(VENT_DESTINATION), isJewelLocked) then
+	if not pivotCharacterToCFrame(CFrame.new(VENT_DESTINATION), isJewelLocked, "Teleporting to Jewelry...") then
 		return
 	end
 
@@ -985,7 +1047,7 @@ local function executeFullSequence()
 	end
 
 	setCharacterNoclip(false)
-	if not waitGuardedSeconds(VENT_WAIT_SECONDS, isJewelLocked) then
+	if not waitGuardedSeconds(VENT_WAIT_SECONDS, isJewelLocked, "Waiting at Jewelry vent...") then
 		return
 	end
 
@@ -995,10 +1057,10 @@ local function executeFullSequence()
 	end
 
 	-- 3. Collect Jewelry cash at final position
-	if not pivotCharacterToCFrame(FINAL_CFRAME) then
+	if not pivotCharacterToCFrame(FINAL_CFRAME, nil, "Collecting Jewelry cash...") then
 		return
 	end
-	if not waitGuardedSeconds(COLLECT_WAIT_SECONDS) then
+	if not waitGuardedSeconds(COLLECT_WAIT_SECONDS, nil, "Collecting Jewelry cash...") then
 		return
 	end
 
@@ -1007,26 +1069,26 @@ local function executeFullSequence()
 		return
 	end
 
-	switchToCriminalsAndRespawn()
+	switchToCriminalsAndRespawn("Teleporting to Club...")
 	if not guardSoloServer(isClubLocked) then
 		return
 	end
 
 	setCharacterNoclip(true)
-	if not pivotCharacterToCFrame(CFrame.new(CLUB_DESTINATION), isClubLocked) then
+	if not pivotCharacterToCFrame(CFrame.new(CLUB_DESTINATION), isClubLocked, "Teleporting to Club...") then
 		return
 	end
 	setCharacterNoclip(false)
 
 	-- 5. Wait until cash reaches $6000 and collect at final position
-	if not waitUntilHeistCashTarget(CLUB_TARGET_CASH, isClubLocked) then
+	if not waitUntilHeistCashTarget(CLUB_TARGET_CASH, isClubLocked, "Robbing Club (" .. CLUB_TARGET_CASH .. ")") then
 		return
 	end
 
-	if not pivotCharacterToCFrame(FINAL_CFRAME) then
+	if not pivotCharacterToCFrame(FINAL_CFRAME, nil, "Collecting Club cash...") then
 		return
 	end
-	if not waitGuardedSeconds(COLLECT_WAIT_SECONDS) then
+	if not waitGuardedSeconds(COLLECT_WAIT_SECONDS, nil, "Collecting Club cash...") then
 		return
 	end
 
@@ -1035,13 +1097,13 @@ local function executeFullSequence()
 		return
 	end
 
-	switchToCriminalsAndRespawn()
+	switchToCriminalsAndRespawn("Teleporting to Casino...")
 	if not guardSoloServer(isCasinoLocked) then
 		return
 	end
 
 	setCharacterNoclip(true)
-	if not pivotCharacterToCFrame(CFrame.new(CASINO_DESTINATION), isCasinoLocked) then
+	if not pivotCharacterToCFrame(CFrame.new(CASINO_DESTINATION), isCasinoLocked, "Teleporting to Casino...") then
 		return
 	end
 	setCharacterNoclip(false)
@@ -1051,10 +1113,10 @@ local function executeFullSequence()
 		return
 	end
 
-	if not pivotCharacterToCFrame(FINAL_CFRAME) then
+	if not pivotCharacterToCFrame(FINAL_CFRAME, nil, "Collecting Casino cash...") then
 		return
 	end
-	if not waitGuardedSeconds(COLLECT_WAIT_SECONDS) then
+	if not waitGuardedSeconds(COLLECT_WAIT_SECONDS, nil, "Collecting Casino cash...") then
 		return
 	end
 
@@ -1063,26 +1125,26 @@ local function executeFullSequence()
 		return
 	end
 
-	switchToCriminalsAndRespawn()
+	switchToCriminalsAndRespawn("Teleporting to Bank...")
 	if not guardSoloServer(isBankLocked) then
 		return
 	end
 
 	setCharacterNoclip(true)
-	if not pivotCharacterToCFrame(CFrame.new(BANK_DESTINATION), isBankLocked) then
+	if not pivotCharacterToCFrame(CFrame.new(BANK_DESTINATION), isBankLocked, "Teleporting to Bank...") then
 		return
 	end
 	setCharacterNoclip(false)
 
 	-- 9. Wait until cash reaches $3000, collect at final position, and rejoin
-	if not waitUntilHeistCashTarget(BANK_TARGET_CASH, isBankLocked) then
+	if not waitUntilHeistCashTarget(BANK_TARGET_CASH, isBankLocked, "Robbing Bank (" .. BANK_TARGET_CASH .. ")") then
 		return
 	end
 
-	if not pivotCharacterToCFrame(FINAL_CFRAME) then
+	if not pivotCharacterToCFrame(FINAL_CFRAME, nil, "Collecting Bank cash...") then
 		return
 	end
-	if not waitGuardedSeconds(COLLECT_WAIT_SECONDS) then
+	if not waitGuardedSeconds(COLLECT_WAIT_SECONDS, nil, "Collecting Bank cash...") then
 		return
 	end
 
