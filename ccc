@@ -1,40 +1,15 @@
 queue_on_teleport('loadstring(game:HttpGet("https://raw.githubusercontent.com/LuaSecurity/Mad-City/refs/heads/main/ccc"))()')
 
-local PathfindingService = game:GetService("PathfindingService")
 local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local TeleportService = game:GetService("TeleportService")
 local TweenService = game:GetService("TweenService")
-local VirtualInputManager = game:GetService("VirtualInputManager")
 local Workspace = game:GetService("Workspace")
 
 local player = Players.LocalPlayer
 
-local DONOR_SETTINGS = {
-	Price = 0,
-	Bounce = 120,
-	Height = 3.5,
-	Sway = 10,
-	Suspension = 20,
-	Softness = 2,
-	TurnSpeed = 2.13,
-	Torque = 1,
-	MaxSpeed = 200,
-	BrakeForce = 2,
-	SpeedDecay = 0.2,
-	Boost = true,
-	BoostParticles = "Middle",
-	Drift = true,
-	VelLerp = 0.1,
-	RotLerp = 0.075,
-	DriftVelLerp = 0.05,
-	DriftRotLerp = 0.1,
-	HideCharacter = true,
-	CameraOffset = 26
-}
-
 local VENT_DESTINATION = Vector3.new(-77, 120, 813)
-local NAV_SPEED = 250
 local BOX_TWEEN_SPEED = 75
 local BOX_Y_OFFSET = -6
 local FIRES_PER_BOX = 3
@@ -46,7 +21,9 @@ local REJOIN_DELAY_SECONDS = 0.5
 local QUEUE_RESPAWN_HANDLER = false
 
 local isRejoining = false
-local objectSelection = nil
+local isSwitchingTeam = false
+local deathConn = nil
+local charAddedConn = nil
 
 local function getLocalPlayer()
 	if player and player.Parent then
@@ -81,7 +58,20 @@ local function hasOtherPlayers()
 	return #Players:GetPlayers() > 1
 end
 
+local function isJewelLocked()
+	local heistStatus = ReplicatedStorage:FindFirstChild("HeistStatus")
+	local jewel = heistStatus and heistStatus:FindFirstChild("Jewel")
+	local locked = jewel and jewel:FindFirstChild("Locked")
+	if locked and locked:IsA("BoolValue") then
+		return locked.Value == true
+	end
+	return false
+end
+
 local function isPlayerDead()
+	if isSwitchingTeam then
+		return false
+	end
 	local humanoid = getHumanoid()
 	if not humanoid then
 		return false
@@ -146,7 +136,19 @@ local function rejoinSameServer(queueHandler)
 	end
 end
 
+local function guardJewelUnlocked()
+	if isJewelLocked() then
+		rejoinSameServer(QUEUE_RESPAWN_HANDLER)
+		return false
+	end
+	return true
+end
+
 local function guardSoloServer()
+	if not guardJewelUnlocked() then
+		return false
+	end
+
 	if isPlayerDead() then
 		rejoinSameServer(QUEUE_RESPAWN_HANDLER)
 		return false
@@ -157,7 +159,14 @@ local function guardSoloServer()
 	end
 
 	while hasOtherPlayers() and not isPlayerDead() do
+		if not guardJewelUnlocked() then
+			return false
+		end
 		task.wait(0.25)
+	end
+
+	if not guardJewelUnlocked() then
+		return false
 	end
 
 	if isPlayerDead() then
@@ -196,7 +205,6 @@ local function waitForGameAndPlayerLoaded()
 		end
 	end
 
-	objectSelection = Workspace:WaitForChild("ObjectSelection")
 	if not Workspace.CurrentCamera then
 		Workspace:GetPropertyChangedSignal("CurrentCamera"):Wait()
 	end
@@ -206,20 +214,87 @@ end
 
 local function bindDeathRejoin()
 	local lp = getLocalPlayer()
+
+	if deathConn then
+		deathConn:Disconnect()
+		deathConn = nil
+	end
+	if charAddedConn then
+		charAddedConn:Disconnect()
+		charAddedConn = nil
+	end
+
 	local function hookCharacter(char)
 		if not char then
 			return
 		end
+		if deathConn then
+			deathConn:Disconnect()
+			deathConn = nil
+		end
 		local hum = char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid", 30)
 		if hum then
-			hum.Died:Connect(function()
-				rejoinSameServer(QUEUE_RESPAWN_HANDLER)
+			deathConn = hum.Died:Connect(function()
+				if not isSwitchingTeam then
+					rejoinSameServer(QUEUE_RESPAWN_HANDLER)
+				end
 			end)
 		end
 	end
 
 	hookCharacter(lp.Character)
-	lp.CharacterAdded:Connect(hookCharacter)
+	charAddedConn = lp.CharacterAdded:Connect(hookCharacter)
+end
+
+local function setTeamToCriminals()
+	local remoteFunc = ReplicatedStorage:FindFirstChild("RemoteFunction") or ReplicatedStorage:WaitForChild("RemoteFunction", 15)
+	if not remoteFunc or not remoteFunc:IsA("RemoteFunction") then
+		warn("ReplicatedStorage.RemoteFunction not found")
+		return false
+	end
+
+	local ok, err = pcall(function()
+		remoteFunc:InvokeServer("SetTeam", "Criminals")
+	end)
+
+	if not ok then
+		warn("Failed to invoke SetTeam Criminals:", tostring(err))
+		return false
+	end
+
+	return true
+end
+
+local function waitForRespawnAfterTeamSwitch(previousCharacter)
+	local lp = getLocalPlayer()
+	local deadline = os.clock() + 20
+	local newChar = lp.Character
+
+	if previousCharacter and newChar == previousCharacter then
+		while os.clock() < deadline do
+			newChar = lp.Character
+			if newChar and newChar ~= previousCharacter and newChar.Parent then
+				break
+			end
+			task.wait(0.05)
+		end
+	end
+
+	while os.clock() < deadline do
+		newChar = lp.Character
+		if newChar and newChar.Parent then
+			local hum = newChar:FindFirstChildOfClass("Humanoid")
+			local root = newChar:FindFirstChild("HumanoidRootPart")
+			if hum and root and hum.Health > 0 then
+				bindDeathRejoin()
+				return newChar
+			end
+		end
+		task.wait(0.05)
+	end
+
+	bindDeathRejoin()
+	return lp.Character
 end
 
 local function getInstancePosition(target)
@@ -242,155 +317,6 @@ local function getInstancePosition(target)
 	return part and part.Position
 end
 
-local function getOriginPosition()
-	local root = getRoot()
-	if root then
-		return root.Position
-	end
-
-	local camera = Workspace.CurrentCamera
-	return camera and camera.CFrame.Position
-end
-
-local function getSeatCFrame(driveSeat)
-	if not driveSeat then
-		return nil
-	end
-
-	if driveSeat:IsA("BasePart") then
-		return driveSeat.CFrame
-	end
-
-	local pos = getInstancePosition(driveSeat)
-	return pos and CFrame.new(pos) or nil
-end
-
-local function hasHelicopterChassisScript(vehicle)
-	local direct = vehicle:FindFirstChild("HelicopterChassis")
-	if direct and (direct:IsA("Script") or direct:IsA("LocalScript")) then
-		return true
-	end
-
-	for _, desc in ipairs(vehicle:GetDescendants()) do
-		if desc.Name == "HelicopterChassis" and (desc:IsA("Script") or desc:IsA("LocalScript")) then
-			return true
-		end
-	end
-
-	return false
-end
-
-local function isAvailableHelicopter(vehicle)
-	if not hasHelicopterChassisScript(vehicle) then
-		return false
-	end
-
-	local ownerValue = vehicle:FindFirstChild("VehicleOwner")
-	if not ownerValue or not ownerValue:IsA("ObjectValue") or ownerValue.Value ~= nil then
-		return false
-	end
-
-	local driveSeat = vehicle:FindFirstChild("DriveSeat")
-	if driveSeat and driveSeat:IsA("Seat") and driveSeat.Occupant ~= nil then
-		return false
-	end
-
-	return true
-end
-
-local function findNearestAvailableVehicle()
-	local origin = getOriginPosition()
-	if not origin then
-		return nil, nil, math.huge
-	end
-
-	local nearestVehicle = nil
-	local nearestSeat = nil
-	local nearestDistance = math.huge
-
-	for _, child in ipairs(objectSelection:GetChildren()) do
-		if child.Name == "WORKINGVEHICLES" and isAvailableHelicopter(child) then
-			local driveSeat = child:FindFirstChild("DriveSeat")
-			local seatPos = getInstancePosition(driveSeat)
-
-			if driveSeat and seatPos then
-				local distance = (seatPos - origin).Magnitude
-				if distance < nearestDistance then
-					nearestDistance = distance
-					nearestVehicle = child
-					nearestSeat = driveSeat
-				end
-			end
-		end
-	end
-
-	return nearestVehicle, nearestSeat, nearestDistance
-end
-
-local function applyVehicleSettings(vehicle)
-	local settingsModule = vehicle:FindFirstChild("Settings")
-	if not settingsModule or not settingsModule:IsA("ModuleScript") then
-		return false
-	end
-
-	local ok, targetSettings = pcall(require, settingsModule)
-	if not ok or type(targetSettings) ~= "table" then
-		warn("Failed to require target vehicle Settings")
-		return false
-	end
-
-	for key, value in pairs(DONOR_SETTINGS) do
-		if key ~= "Price" then
-			targetSettings[key] = value
-		end
-	end
-
-	targetSettings.Price = 0
-	return true
-end
-
-local function pressKeyOnce(keyCode, holdTime)
-	holdTime = holdTime or 0.05
-	VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
-	task.wait(holdTime)
-	VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
-end
-
-local function pressKeyTwice(keyCode, holdTime, delayBetween)
-	holdTime = holdTime or 0.05
-	delayBetween = delayBetween or 0.12
-
-	for i = 1, 2 do
-		if not guardSoloServer() then
-			return
-		end
-		pressKeyOnce(keyCode, holdTime)
-		if i < 2 then
-			task.wait(delayBetween)
-		end
-	end
-end
-
-local function exitVehicleWithJump()
-	if not guardSoloServer() then
-		return
-	end
-
-	local humanoid = getHumanoid()
-	if humanoid then
-		humanoid.Jump = true
-		humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-	end
-
-	pressKeyOnce(Enum.KeyCode.Space, 0.06)
-	task.wait(0.2)
-
-	if humanoid and humanoid.SeatPart then
-		humanoid.Sit = false
-		task.wait(0.1)
-	end
-end
-
 local function setCharacterNoclip(enabled)
 	local character = getCharacter()
 	if not character then
@@ -404,60 +330,13 @@ local function setCharacterNoclip(enabled)
 	end
 end
 
-local function setVehicleAndCharacterNoclip(vehicle, enabled)
-	local targets = { getCharacter(), vehicle }
-	for _, container in ipairs(targets) do
-		if container then
-			for _, desc in ipairs(container:GetDescendants()) do
-				if desc:IsA("BasePart") then
-					desc.CanCollide = not enabled
-				end
-			end
-		end
-	end
-end
-
-local function getVehiclePrimaryPart(vehicle)
-	if not vehicle then
-		return getRoot()
-	end
-
-	if vehicle:IsA("Model") and vehicle.PrimaryPart then
-		return vehicle.PrimaryPart
-	end
-
-	return vehicle:FindFirstChild("Chassis")
-		or vehicle:FindFirstChild("DriveSeat")
-		or vehicle:FindFirstChildWhichIsA("BasePart", true)
-		or getRoot()
-end
-
-local function moveVehicleToCFrame(vehicle, targetCFrame)
-	if vehicle and vehicle:IsA("Model") and vehicle.PrimaryPart then
-		vehicle:PivotTo(targetCFrame)
-		return
-	end
-
-	local primary = getVehiclePrimaryPart(vehicle)
-	if primary and vehicle and vehicle:IsA("Model") then
-		local offset = vehicle:GetPivot():ToObjectSpace(primary.CFrame)
-		vehicle:PivotTo(targetCFrame * offset:Inverse())
-		return
-	end
-
-	local character = getCharacter()
-	if character then
-		character:PivotTo(targetCFrame)
-	end
-end
-
-local function tweenInstanceOrVehicleToPosition(target, destination, speed)
+local function tweenCharacterToPosition(destination, speed)
 	if not guardSoloServer() then
 		return false
 	end
 
-	speed = math.max(speed or NAV_SPEED, 1)
-	local primary = target and getVehiclePrimaryPart(target) or getRoot()
+	speed = math.max(speed or BOX_TWEEN_SPEED, 1)
+	local primary = getRoot()
 	if not primary then
 		return false
 	end
@@ -480,7 +359,7 @@ local function tweenInstanceOrVehicleToPosition(target, destination, speed)
 
 	local paused = false
 	local conn = proxy.Changed:Connect(function(newCFrame)
-		if isPlayerDead() then
+		if isJewelLocked() or isPlayerDead() then
 			rejoinSameServer(QUEUE_RESPAWN_HANDLER)
 			return
 		end
@@ -491,13 +370,9 @@ local function tweenInstanceOrVehicleToPosition(target, destination, speed)
 		end
 
 		paused = false
-		if target then
-			moveVehicleToCFrame(target, newCFrame)
-		else
-			local character = getCharacter()
-			if character then
-				character:PivotTo(newCFrame)
-			end
+		local character = getCharacter()
+		if character then
+			character:PivotTo(newCFrame)
 		end
 	end)
 
@@ -509,7 +384,7 @@ local function tweenInstanceOrVehicleToPosition(target, destination, speed)
 
 	tween:Play()
 	while tween.PlaybackState == Enum.PlaybackState.Playing do
-		if isPlayerDead() then
+		if isJewelLocked() or isPlayerDead() then
 			tween:Cancel()
 			conn:Disconnect()
 			proxy:Destroy()
@@ -519,10 +394,10 @@ local function tweenInstanceOrVehicleToPosition(target, destination, speed)
 
 		if hasOtherPlayers() then
 			tween:Pause()
-			while hasOtherPlayers() and not isPlayerDead() do
+			while hasOtherPlayers() and not isPlayerDead() and not isJewelLocked() do
 				task.wait(0.2)
 			end
-			if isPlayerDead() then
+			if isJewelLocked() or isPlayerDead() then
 				tween:Cancel()
 				conn:Disconnect()
 				proxy:Destroy()
@@ -537,47 +412,7 @@ local function tweenInstanceOrVehicleToPosition(target, destination, speed)
 
 	conn:Disconnect()
 	proxy:Destroy()
-	return not paused and not isPlayerDead()
-end
-
-local function navigateVehicleWithPathfinding(vehicle, destination, speed)
-	if not guardSoloServer() then
-		return false
-	end
-
-	local primary = getVehiclePrimaryPart(vehicle)
-	if not primary then
-		return false
-	end
-
-	local path = PathfindingService:CreatePath({
-		AgentRadius = 4,
-		AgentHeight = 5,
-		AgentCanJump = true,
-		AgentCanClimb = true,
-		WaypointSpacing = 25
-	})
-
-	local ok = pcall(function()
-		path:ComputeAsync(primary.Position, destination)
-	end)
-
-	if ok and path.Status == Enum.PathStatus.Success then
-		local waypoints = path:GetWaypoints()
-		for i = 2, #waypoints do
-			if not guardSoloServer() then
-				return false
-			end
-			local wpPos = waypoints[i].Position + Vector3.new(0, 2.5, 0)
-			tweenInstanceOrVehicleToPosition(vehicle, wpPos, speed)
-		end
-	end
-
-	if not guardSoloServer() then
-		return false
-	end
-
-	return tweenInstanceOrVehicleToPosition(vehicle, destination, speed)
+	return not paused and not isPlayerDead() and not isJewelLocked()
 end
 
 local function findProximityPrompt(container)
@@ -709,6 +544,10 @@ local function findNextBoxToTween(boxes, currentIndex)
 end
 
 local function runJewelryBoxFarmUntilTargetCash()
+	if not guardJewelUnlocked() then
+		return false
+	end
+
 	local jewelryStore = Workspace:FindFirstChild("JewelryStore")
 	local jewelryBoxesFolder = jewelryStore and jewelryStore:FindFirstChild("JewelryBoxes")
 	local manager = jewelryBoxesFolder and jewelryBoxesFolder:FindFirstChild("JewelryManager")
@@ -724,23 +563,23 @@ local function runJewelryBoxFarmUntilTargetCash()
 	local nextIndex = 1
 
 	local noclipConn = RunService.Stepped:Connect(function()
-		if not hasOtherPlayers() and not isPlayerDead() then
+		if not hasOtherPlayers() and not isPlayerDead() and not isJewelLocked() then
 			setCharacterNoclip(true)
 		end
 	end)
 
 	while not hasReachedTargetCash() do
-		if isPlayerDead() then
+		if isJewelLocked() or isPlayerDead() then
 			noclipConn:Disconnect()
 			rejoinSameServer(QUEUE_RESPAWN_HANDLER)
 			return false
 		end
 
 		if hasOtherPlayers() then
-			while hasOtherPlayers() and not isPlayerDead() do
+			while hasOtherPlayers() and not isPlayerDead() and not isJewelLocked() do
 				task.wait(0.25)
 			end
-			if isPlayerDead() then
+			if isJewelLocked() or isPlayerDead() then
 				noclipConn:Disconnect()
 				rejoinSameServer(QUEUE_RESPAWN_HANDLER)
 				return false
@@ -760,11 +599,11 @@ local function runJewelryBoxFarmUntilTargetCash()
 		if targetBox then
 			local boxPos = getInstancePosition(targetBox)
 			if boxPos and guardSoloServer() then
-				tweenInstanceOrVehicleToPosition(nil, boxPos + Vector3.new(0, BOX_Y_OFFSET, 0), BOX_TWEEN_SPEED)
+				tweenCharacterToPosition(boxPos + Vector3.new(0, BOX_Y_OFFSET, 0), BOX_TWEEN_SPEED)
 			end
 		end
 
-		if isPlayerDead() then
+		if isJewelLocked() or isPlayerDead() then
 			noclipConn:Disconnect()
 			rejoinSameServer(QUEUE_RESPAWN_HANDLER)
 			return false
@@ -774,7 +613,7 @@ local function runJewelryBoxFarmUntilTargetCash()
 			break
 		end
 
-		if not hasOtherPlayers() then
+		if not hasOtherPlayers() and not isJewelLocked() then
 			fireAllJewelryBoxesAtOnce(jewelryBoxesFolder, event, FIRES_PER_BOX)
 		end
 
@@ -783,48 +622,23 @@ local function runJewelryBoxFarmUntilTargetCash()
 
 	noclipConn:Disconnect()
 	setCharacterNoclip(false)
-	return not isPlayerDead()
+	return not isPlayerDead() and not isJewelLocked()
 end
 
-local function claimNearestVehicle()
+local function teleportToJewelryTop()
 	if not guardSoloServer() then
-		return nil, nil
-	end
-
-	local root = getRoot()
-	if not root then
-		warn("Character or HumanoidRootPart not found")
-		return nil, nil
-	end
-
-	local vehicle, driveSeat = findNearestAvailableVehicle()
-	if not vehicle or not driveSeat then
-		warn("No available unowned WORKINGVEHICLES with HelicopterChassis found")
-		return nil, nil
-	end
-
-	applyVehicleSettings(vehicle)
-
-	local seatCFrame = getSeatCFrame(driveSeat)
-	if not seatCFrame then
-		warn("DriveSeat has no valid position or CFrame")
-		return nil, nil
-	end
-
-	if not guardSoloServer() then
-		return nil, nil
+		return false
 	end
 
 	local character = getCharacter()
-	if character then
-		character:PivotTo(seatCFrame * CFrame.new(0, 2.5, 0))
+	if not character then
+		warn("Character not found for jewelry top teleport")
+		return false
 	end
 
-	task.wait(0.1)
-	pressKeyTwice(Enum.KeyCode.E, 0.05, 0.15)
-	task.wait(0.25)
-
-	return vehicle, driveSeat
+	setCharacterNoclip(true)
+	character:PivotTo(CFrame.new(VENT_DESTINATION))
+	return true
 end
 
 local function teleportFinal()
@@ -850,27 +664,25 @@ local function executeFullSequence()
 		return
 	end
 
-	local claimedVehicle = claimNearestVehicle()
-	if not claimedVehicle then
-		warn("Sequence aborted: could not claim vehicle")
-		return
-	end
+	local previousCharacter = getCharacter()
+	isSwitchingTeam = true
+	setTeamToCriminals()
+	waitForRespawnAfterTeamSwitch(previousCharacter)
+	isSwitchingTeam = false
 
 	if not guardSoloServer() then
 		return
 	end
 
-	setVehicleAndCharacterNoclip(claimedVehicle, true)
-	if not navigateVehicleWithPathfinding(claimedVehicle, VENT_DESTINATION, NAV_SPEED) then
+	if not teleportToJewelryTop() then
 		return
 	end
 
-	exitVehicleWithJump()
 	if not fireVentTouchAndPrompt() then
 		return
 	end
 
-	setVehicleAndCharacterNoclip(claimedVehicle, false)
+	setCharacterNoclip(false)
 
 	local waitDeadline = os.clock() + VENT_WAIT_SECONDS
 	while os.clock() < waitDeadline do
