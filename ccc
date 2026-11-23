@@ -11,13 +11,18 @@ local player = Players.LocalPlayer
 
 local VENT_DESTINATION = Vector3.new(-77, 120, 813)
 local CLUB_DESTINATION = Vector3.new(1328, 146, -127)
+local CASINO_DESTINATION = Vector3.new(1655, 26, 524)
+local BANK_DESTINATION = Vector3.new(763, 1, 479)
 local BOX_TWEEN_SPEED = 75
 local BOX_Y_OFFSET = -6
 local FIRES_PER_BOX = 3
+local FIRES_PER_LEVER = 1
 local VENT_WAIT_SECONDS = 4
 local COLLECT_WAIT_SECONDS = 1.5
 local JEWEL_TARGET_CASH = "$5000"
 local CLUB_TARGET_CASH = "$6000"
+local CASINO_TARGET_CASH = "$4000"
+local BANK_TARGET_CASH = "$3000"
 local MAX_FARM_SECONDS = 120
 local FINAL_CFRAME = CFrame.new(2137, 26, 363)
 local REJOIN_DELAY_SECONDS = 0.5
@@ -78,7 +83,22 @@ end
 
 local function isClubLocked()
 	local locked = getHeistLockedValue("Club")
-	-- Must be explicitly false; treat missing or true as locked/unavailable
+	if not locked then
+		return true
+	end
+	return locked.Value ~= false
+end
+
+local function isCasinoLocked()
+	local locked = getHeistLockedValue("Casino")
+	if not locked then
+		return true
+	end
+	return locked.Value ~= false
+end
+
+local function isBankLocked()
+	local locked = getHeistLockedValue("Bank")
 	if not locked then
 		return true
 	end
@@ -648,30 +668,148 @@ local function runJewelryBoxFarmUntilTargetCash()
 	return not isPlayerDead() and not isJewelLocked()
 end
 
-local function waitUntilClubCashTarget(targetText)
-	if not guardHeistCondition(isClubLocked) then
+local function collectCasinoLeverEvents()
+	local events = {}
+	local seen = {}
+
+	local function addEvent(ev)
+		if ev and ev:IsA("RemoteEvent") and not seen[ev] then
+			seen[ev] = true
+			table.insert(events, ev)
+		end
+	end
+
+	local objectSelection = Workspace:FindFirstChild("ObjectSelection")
+	if objectSelection then
+		for _, child in ipairs(objectSelection:GetChildren()) do
+			if child.Name == "Lever" then
+				local lever2 = child:FindFirstChild("Lever")
+				local lever3 = lever2 and lever2:FindFirstChild("Lever")
+				local ev = lever3 and lever3:FindFirstChild("Event")
+				addEvent(ev)
+
+				for _, desc in ipairs(child:GetDescendants()) do
+					if desc.Name == "Event" and desc:IsA("RemoteEvent") then
+						addEvent(desc)
+					end
+				end
+			end
+		end
+	end
+
+	if #events == 0 then
+		for _, desc in ipairs(Workspace:GetDescendants()) do
+			if desc.Name == "Event" and desc:IsA("RemoteEvent") and desc.Parent and desc.Parent.Name == "Lever" then
+				addEvent(desc)
+			end
+		end
+	end
+
+	return events
+end
+
+local function fireAllCasinoLeversOnce(events)
+	local firedCount = 0
+	for _, ev in ipairs(events) do
+		if ev and ev.Parent then
+			for _ = 1, FIRES_PER_LEVER do
+				pcall(function()
+					ev:FireServer()
+				end)
+			end
+			firedCount = firedCount + 1
+		end
+	end
+	return firedCount
+end
+
+local function runCasinoFarmUntilTargetCash()
+	if not guardHeistCondition(isCasinoLocked) then
 		return false
 	end
 
+	local leverEvents = collectCasinoLeverEvents()
+	local deadline = os.clock() + 10
+	while #leverEvents < 4 and os.clock() < deadline do
+		if not guardSoloServer(isCasinoLocked) then
+			return false
+		end
+		task.wait(0.25)
+		leverEvents = collectCasinoLeverEvents()
+	end
+
+	fireAllCasinoLeversOnce(leverEvents)
+
 	local startClock = os.clock()
+	local nextLeverFireClock = os.clock() + 1.5
+
 	local noclipConn = RunService.Stepped:Connect(function()
-		if not hasOtherPlayers() and not isPlayerDead() and not isClubLocked() then
+		if not hasOtherPlayers() and not isPlayerDead() and not isCasinoLocked() then
 			setCharacterNoclip(true)
 		end
 	end)
 
-	while not hasReachedCashTarget(targetText) do
-		if isClubLocked() or isPlayerDead() then
+	while not hasReachedCashTarget(CASINO_TARGET_CASH) do
+		if isCasinoLocked() or isPlayerDead() then
 			noclipConn:Disconnect()
 			rejoinSameServer(QUEUE_RESPAWN_HANDLER)
 			return false
 		end
 
 		if hasOtherPlayers() then
-			while hasOtherPlayers() and not isPlayerDead() and not isClubLocked() do
+			while hasOtherPlayers() and not isPlayerDead() and not isCasinoLocked() do
 				task.wait(0.25)
 			end
-			if isClubLocked() or isPlayerDead() then
+			if isCasinoLocked() or isPlayerDead() then
+				noclipConn:Disconnect()
+				rejoinSameServer(QUEUE_RESPAWN_HANDLER)
+				return false
+			end
+		end
+
+		if os.clock() >= nextLeverFireClock then
+			leverEvents = collectCasinoLeverEvents()
+			fireAllCasinoLeversOnce(leverEvents)
+			nextLeverFireClock = os.clock() + 1.5
+		end
+
+		if MAX_FARM_SECONDS and (os.clock() - startClock) >= MAX_FARM_SECONDS then
+			warn("Reached MAX_FARM_SECONDS waiting for " .. CASINO_TARGET_CASH)
+			break
+		end
+
+		task.wait(0.2)
+	end
+
+	noclipConn:Disconnect()
+	setCharacterNoclip(false)
+	return not isPlayerDead() and not isCasinoLocked()
+end
+
+local function waitUntilHeistCashTarget(targetText, failConditionFn)
+	if failConditionFn and not guardHeistCondition(failConditionFn) then
+		return false
+	end
+
+	local startClock = os.clock()
+	local noclipConn = RunService.Stepped:Connect(function()
+		if not hasOtherPlayers() and not isPlayerDead() and not (failConditionFn and failConditionFn()) then
+			setCharacterNoclip(true)
+		end
+	end)
+
+	while not hasReachedCashTarget(targetText) do
+		if (failConditionFn and failConditionFn()) or isPlayerDead() then
+			noclipConn:Disconnect()
+			rejoinSameServer(QUEUE_RESPAWN_HANDLER)
+			return false
+		end
+
+		if hasOtherPlayers() then
+			while hasOtherPlayers() and not isPlayerDead() and not (failConditionFn and failConditionFn()) do
+				task.wait(0.25)
+			end
+			if (failConditionFn and failConditionFn()) or isPlayerDead() then
 				noclipConn:Disconnect()
 				rejoinSameServer(QUEUE_RESPAWN_HANDLER)
 				return false
@@ -688,7 +826,7 @@ local function waitUntilClubCashTarget(targetText)
 
 	noclipConn:Disconnect()
 	setCharacterNoclip(false)
-	return not isPlayerDead() and not isClubLocked()
+	return not isPlayerDead() and not (failConditionFn and failConditionFn())
 end
 
 local function pivotCharacterToCFrame(targetCFrame, failConditionFn)
@@ -774,8 +912,64 @@ local function executeFullSequence()
 	end
 	setCharacterNoclip(false)
 
-	-- 5. Wait until cash reaches $6000, collect at final position, and rejoin
-	if not waitUntilClubCashTarget(CLUB_TARGET_CASH) then
+	-- 5. Wait until cash reaches $6000 and collect at final position
+	if not waitUntilHeistCashTarget(CLUB_TARGET_CASH, isClubLocked) then
+		return
+	end
+
+	if not pivotCharacterToCFrame(FINAL_CFRAME) then
+		return
+	end
+	if not waitGuardedSeconds(COLLECT_WAIT_SECONDS) then
+		return
+	end
+
+	-- 6. Verify Casino is open (Locked == false), switch team, and immediately TP to 1655, 26, 524
+	if not guardSoloServer(isCasinoLocked) then
+		return
+	end
+
+	switchToCriminalsAndRespawn()
+	if not guardSoloServer(isCasinoLocked) then
+		return
+	end
+
+	setCharacterNoclip(true)
+	if not pivotCharacterToCFrame(CFrame.new(CASINO_DESTINATION), isCasinoLocked) then
+		return
+	end
+	setCharacterNoclip(false)
+
+	-- 7. Fire all 4 Casino levers, wait until cash reaches $4000, and collect at final position
+	if not runCasinoFarmUntilTargetCash() then
+		return
+	end
+
+	if not pivotCharacterToCFrame(FINAL_CFRAME) then
+		return
+	end
+	if not waitGuardedSeconds(COLLECT_WAIT_SECONDS) then
+		return
+	end
+
+	-- 8. Verify Bank is open (Locked == false), switch team, and immediately TP to 763, 1, 479
+	if not guardSoloServer(isBankLocked) then
+		return
+	end
+
+	switchToCriminalsAndRespawn()
+	if not guardSoloServer(isBankLocked) then
+		return
+	end
+
+	setCharacterNoclip(true)
+	if not pivotCharacterToCFrame(CFrame.new(BANK_DESTINATION), isBankLocked) then
+		return
+	end
+	setCharacterNoclip(false)
+
+	-- 9. Wait until cash reaches $3000, collect at final position, and rejoin
+	if not waitUntilHeistCashTarget(BANK_TARGET_CASH, isBankLocked) then
 		return
 	end
 
