@@ -1,4 +1,17 @@
-queue_on_teleport('loadstring(game:HttpGet("https://raw.githubusercontent.com/LuaSecurity/Mad-City/refs/heads/main/ccc"))()')
+--[[
+	Mad City Auto-Farm (organized)
+	Behavior:
+	- Farms Jewel -> Club -> Casino -> Bank, collecting cash at FINAL_CFRAME between each.
+	- If ANY other player is in the server:
+		* switches team to Criminals,
+		* if a heist is in progress (mid-heist), teleports to FINAL_CFRAME and stays there
+		  completely still doing NOTHING (no rejoin, no farming),
+		* resumes the sequence automatically once the server is solo again.
+]]
+
+--------------------------------------------------------------------------------
+-- CONFIG
+--------------------------------------------------------------------------------
 
 local CoreGui = game:GetService("CoreGui")
 local Players = game:GetService("Players")
@@ -10,31 +23,51 @@ local Workspace = game:GetService("Workspace")
 
 local player = Players.LocalPlayer
 
+-- Destinations
 local VENT_DESTINATION = Vector3.new(-77, 120, 813)
 local CLUB_DESTINATION = Vector3.new(1328, 146, -127)
 local CASINO_DESTINATION = Vector3.new(1655, 26, 524)
 local BANK_DESTINATION = Vector3.new(763, 1, 479)
+
+-- Tuning
 local BOX_TWEEN_SPEED = 75
 local BOX_Y_OFFSET = -6
 local FIRES_PER_BOX = 3
 local FIRES_PER_LEVER = 1
 local VENT_WAIT_SECONDS = 4
 local COLLECT_WAIT_SECONDS = 1.5
+local LEVER_REFIRE_INTERVAL = 1.5
+local IDLE_CHECK_INTERVAL = 0.25 -- poll rate while other players are present
+local HIDE_SNAP_DISTANCE = 5 -- re-pivot to FINAL_CFRAME if drifted further than this
+
+-- Targets
 local JEWEL_TARGET_CASH = "$5000"
 local CLUB_TARGET_CASH = "$6000"
 local CASINO_TARGET_CASH = "$4000"
 local BANK_TARGET_CASH = "$3000"
 local MAX_FARM_SECONDS = 120
+
+-- Rejoin / respawn
 local FINAL_CFRAME = CFrame.new(2137, 26, 363)
 local REJOIN_DELAY_SECONDS = 0.5
 local QUEUE_RESPAWN_HANDLER = false
 
+--------------------------------------------------------------------------------
+-- STATE
+--------------------------------------------------------------------------------
+
 local isRejoining = false
 local isSwitchingTeam = false
+local isHiding = false -- true while another player is in the server and we are idling
+local isMidHeist = false -- true between "heist started" and "cash collected"
 local deathConn = nil
 local charAddedConn = nil
 local currentStepText = "Starting..."
 local stepLabelRef = nil
+
+--------------------------------------------------------------------------------
+-- CORE HELPERS
+--------------------------------------------------------------------------------
 
 local function setStepStatus(text)
 	currentStepText = tostring(text)
@@ -58,8 +91,7 @@ local function getLocalPlayer()
 end
 
 local function getCharacter()
-	local lp = getLocalPlayer()
-	return lp.Character
+	return getLocalPlayer().Character
 end
 
 local function getRoot()
@@ -76,6 +108,21 @@ local function hasOtherPlayers()
 	return #Players:GetPlayers() > 1
 end
 
+local function isPlayerDead()
+	if isSwitchingTeam or isHiding then
+		return false
+	end
+	local humanoid = getHumanoid()
+	if not humanoid then
+		return false
+	end
+	return humanoid.Health <= 0 or humanoid:GetState() == Enum.HumanoidStateType.Dead
+end
+
+--------------------------------------------------------------------------------
+-- HEIST STATUS
+--------------------------------------------------------------------------------
+
 local function getHeistLockedValue(heistName)
 	local heistStatus = ReplicatedStorage:FindFirstChild("HeistStatus")
 	local heist = heistStatus and heistStatus:FindFirstChild(heistName)
@@ -86,45 +133,25 @@ local function getHeistLockedValue(heistName)
 	return nil
 end
 
-local function isJewelLocked()
-	local locked = getHeistLockedValue("Jewel")
-	return locked and locked.Value == true or false
+-- Generic checker: missing Locked value => treat as closed (except Jewel, where missing => open)
+local function makeLockedChecker(heistName, treatMissingAsLocked)
+	return function()
+		local locked = getHeistLockedValue(heistName)
+		if not locked then
+			return treatMissingAsLocked and true or false
+		end
+		return locked.Value ~= false
+	end
 end
 
-local function isClubLocked()
-	local locked = getHeistLockedValue("Club")
-	if not locked then
-		return true
-	end
-	return locked.Value ~= false
-end
+local isJewelLocked = makeLockedChecker("Jewel", false)
+local isClubLocked = makeLockedChecker("Club", true)
+local isCasinoLocked = makeLockedChecker("Casino", true)
+local isBankLocked = makeLockedChecker("Bank", true)
 
-local function isCasinoLocked()
-	local locked = getHeistLockedValue("Casino")
-	if not locked then
-		return true
-	end
-	return locked.Value ~= false
-end
-
-local function isBankLocked()
-	local locked = getHeistLockedValue("Bank")
-	if not locked then
-		return true
-	end
-	return locked.Value ~= false
-end
-
-local function isPlayerDead()
-	if isSwitchingTeam then
-		return false
-	end
-	local humanoid = getHumanoid()
-	if not humanoid then
-		return false
-	end
-	return humanoid.Health <= 0 or humanoid:GetState() == Enum.HumanoidStateType.Dead
-end
+--------------------------------------------------------------------------------
+-- REJOIN
+--------------------------------------------------------------------------------
 
 local function getQueueTeleportFn()
 	if type(queueteleport) == "function" then
@@ -184,6 +211,145 @@ local function rejoinSameServer(queueHandler)
 	end
 end
 
+--------------------------------------------------------------------------------
+-- FORWARD DECLARATIONS
+--------------------------------------------------------------------------------
+
+local bindDeathRejoin -- defined in "LOADING & DEATH HANDLING" below
+
+--------------------------------------------------------------------------------
+-- TEAM SWITCH
+--------------------------------------------------------------------------------
+
+local function setTeamToCriminals()
+	local remoteFunc = ReplicatedStorage:FindFirstChild("RemoteFunction") or ReplicatedStorage:WaitForChild("RemoteFunction", 15)
+	if not remoteFunc or not remoteFunc:IsA("RemoteFunction") then
+		warn("ReplicatedStorage.RemoteFunction not found")
+		return false
+	end
+
+	local ok, err = pcall(function()
+		remoteFunc:InvokeServer("SetTeam", "Criminals")
+	end)
+
+	if not ok then
+		warn("Failed to invoke SetTeam Criminals:", tostring(err))
+		return false
+	end
+
+	return true
+end
+
+local function switchToCriminalsAndRespawn(nextStepLabel)
+	local previousCharacter = getCharacter()
+	setStepStatus("Switching team & respawning...")
+	isSwitchingTeam = true
+	setTeamToCriminals()
+
+	local lp = getLocalPlayer()
+	local deadline = os.clock() + 20
+	local newChar = lp.Character
+
+	if previousCharacter and newChar == previousCharacter then
+		while os.clock() < deadline do
+			newChar = lp.Character
+			if newChar and newChar ~= previousCharacter and newChar.Parent then
+				break
+			end
+			task.wait(0.05)
+		end
+	end
+
+	while os.clock() < deadline do
+		newChar = lp.Character
+		if newChar and newChar.Parent then
+			local hum = newChar:FindFirstChildOfClass("Humanoid")
+			local root = newChar:FindFirstChild("HumanoidRootPart")
+			if hum and root and hum.Health > 0 then
+				isSwitchingTeam = false
+				bindDeathRejoin()
+				if nextStepLabel then
+					setStepStatus(nextStepLabel)
+				end
+				return newChar
+			end
+		end
+		task.wait(0.05)
+	end
+
+	isSwitchingTeam = false
+	bindDeathRejoin()
+	if nextStepLabel then
+		setStepStatus(nextStepLabel)
+	end
+	return lp.Character
+end
+
+--------------------------------------------------------------------------------
+-- PLAYER-PRESENCE HANDLER (idling while others are in the server)
+--------------------------------------------------------------------------------
+
+-- Central handler for "someone else is in the server":
+-- 1. switch team to Criminals (once per hide),
+-- 2. if mid-heist, teleport to FINAL_CFRAME and stay perfectly still,
+-- 3. do NOTHING (no rejoin, no farming) until the server is solo again,
+-- 4. resume whatever step was running.
+-- Returns true when it is safe to resume, false when the step must abort (rejoin).
+local function waitForServerEmpty(failConditionFn, resumeLabel)
+	if not hasOtherPlayers() then
+		return true
+	end
+
+	-- Hard-fail checks before idling
+	if failConditionFn and failConditionFn() then
+		rejoinSameServer(QUEUE_RESPAWN_HANDLER)
+		return false
+	end
+	if isPlayerDead() then
+		rejoinSameServer(QUEUE_RESPAWN_HANDLER)
+		return false
+	end
+
+	isHiding = true
+	setStepStatus("Player in server - idling...")
+
+	-- Switch to Criminals (plain team set; no respawn-wait logic needed while idling)
+	pcall(setTeamToCriminals)
+	task.wait(0.5)
+
+	while hasOtherPlayers() do
+		-- While hiding we deliberately ignore heist-lock changes; we simply stay put
+		-- doing nothing until the other player leaves.
+		if isMidHeist then
+			local character = getCharacter()
+			local root = character and getRoot()
+			if character and character.Parent and root and not isPlayerDead() then
+				if (root.Position - FINAL_CFRAME.Position).Magnitude > HIDE_SNAP_DISTANCE then
+					character:PivotTo(FINAL_CFRAME)
+				end
+			end
+		end
+		task.wait(IDLE_CHECK_INTERVAL)
+	end
+
+	isHiding = false
+
+	-- Server is solo again: normal resume checks
+	if failConditionFn and failConditionFn() then
+		rejoinSameServer(QUEUE_RESPAWN_HANDLER)
+		return false
+	end
+	if isPlayerDead() then
+		rejoinSameServer(QUEUE_RESPAWN_HANDLER)
+		return false
+	end
+
+	if resumeLabel then
+		setStepStatus(resumeLabel)
+	end
+	return true
+end
+
 local function guardHeistCondition(failConditionFn)
 	if failConditionFn() then
 		rejoinSameServer(QUEUE_RESPAWN_HANDLER)
@@ -192,6 +358,7 @@ local function guardHeistCondition(failConditionFn)
 	return true
 end
 
+-- Guarantees we are solo + alive (+ optional heist condition) before an action.
 local function guardSoloServer(failConditionFn)
 	if failConditionFn and not guardHeistCondition(failConditionFn) then
 		return false
@@ -202,31 +369,144 @@ local function guardSoloServer(failConditionFn)
 		return false
 	end
 
-	if not hasOtherPlayers() then
+	return waitForServerEmpty(failConditionFn, currentStepText)
+end
+
+--------------------------------------------------------------------------------
+-- MOVEMENT
+--------------------------------------------------------------------------------
+
+local function setCharacterNoclip(enabled)
+	local character = getCharacter()
+	if not character then
+		return
+	end
+
+	for _, desc in ipairs(character:GetDescendants()) do
+		if desc:IsA("BasePart") then
+			desc.CanCollide = not enabled
+		end
+	end
+end
+
+local function tweenCharacterToPosition(destination, speed, failConditionFn)
+	if not guardSoloServer(failConditionFn) then
+		return false
+	end
+
+	speed = math.max(speed or BOX_TWEEN_SPEED, 1)
+	local primary = getRoot()
+	if not primary then
+		return false
+	end
+
+	local startPos = primary.Position
+	local distance = (destination - startPos).Magnitude
+	if distance < 0.5 then
 		return true
 	end
 
-	local prevStep = currentStepText
-	setStepStatus("Waiting (other player in server)")
-	while hasOtherPlayers() and not isPlayerDead() do
-		if failConditionFn and not guardHeistCondition(failConditionFn) then
+	local duration = distance / speed
+	local lookDir = (destination - startPos).Unit
+	local flatDir = Vector3.new(lookDir.X, 0, lookDir.Z)
+	local goalCFrame = flatDir.Magnitude > 0.001
+		and CFrame.lookAt(destination, destination + flatDir)
+		or CFrame.new(destination)
+
+	local proxy = Instance.new("CFrameValue")
+	proxy.Value = primary.CFrame
+
+	local paused = false
+	local conn = proxy.Changed:Connect(function(newCFrame)
+		if (failConditionFn and failConditionFn()) or isPlayerDead() then
+			rejoinSameServer(QUEUE_RESPAWN_HANDLER)
+			return
+		end
+
+		if hasOtherPlayers() then
+			paused = true
+			return
+		end
+
+		paused = false
+		local character = getCharacter()
+		if character then
+			character:PivotTo(newCFrame)
+		end
+	end)
+
+	local tween = TweenService:Create(
+		proxy,
+		TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out),
+		{ Value = goalCFrame }
+	)
+
+	tween:Play()
+	while tween.PlaybackState == Enum.PlaybackState.Playing do
+		if (failConditionFn and failConditionFn()) or isPlayerDead() then
+			tween:Cancel()
+			conn:Disconnect()
+			proxy:Destroy()
+			rejoinSameServer(QUEUE_RESPAWN_HANDLER)
 			return false
 		end
-		task.wait(0.25)
+
+		if hasOtherPlayers() then
+			tween:Pause()
+			if not waitForServerEmpty(failConditionFn, currentStepText) then
+				tween:Cancel()
+				conn:Disconnect()
+				proxy:Destroy()
+				return false
+			end
+			tween:Play()
+		end
+
+		RunService.Heartbeat:Wait()
 	end
 
-	if failConditionFn and not guardHeistCondition(failConditionFn) then
+	conn:Disconnect()
+	proxy:Destroy()
+	return not paused and not isPlayerDead() and not (failConditionFn and failConditionFn())
+end
+
+local function pivotCharacterToCFrame(targetCFrame, failConditionFn, stepLabel)
+	if stepLabel then
+		setStepStatus(stepLabel)
+	end
+
+	if not guardSoloServer(failConditionFn) then
 		return false
 	end
 
-	if isPlayerDead() then
-		rejoinSameServer(QUEUE_RESPAWN_HANDLER)
+	local character = getCharacter()
+	if not character then
+		warn("Character not found for teleport")
 		return false
 	end
 
-	setStepStatus(prevStep)
+	character:PivotTo(targetCFrame)
 	return true
 end
+
+local function waitGuardedSeconds(seconds, failConditionFn, waitStepLabel)
+	if waitStepLabel then
+		setStepStatus(waitStepLabel)
+	end
+
+	local deadline = os.clock() + seconds
+	while os.clock() < deadline do
+		if not guardSoloServer(failConditionFn) then
+			return false
+		end
+		task.wait(0.1)
+	end
+	return true
+end
+
+--------------------------------------------------------------------------------
+-- LOADING & DEATH HANDLING
+--------------------------------------------------------------------------------
 
 local function waitForGameAndPlayerLoaded()
 	setStepStatus("Waiting for game & character...")
@@ -264,7 +544,7 @@ local function waitForGameAndPlayerLoaded()
 	task.wait(0.3)
 end
 
-local function bindDeathRejoin()
+function bindDeathRejoin()
 	local lp = getLocalPlayer()
 
 	if deathConn then
@@ -287,10 +567,13 @@ local function bindDeathRejoin()
 		local hum = char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid", 30)
 		if hum then
 			deathConn = hum.Died:Connect(function()
-				if not isSwitchingTeam then
-					setStepStatus("Died - rejoining...")
-					rejoinSameServer(QUEUE_RESPAWN_HANDLER)
+				-- While idling (other players in server) we do NOT rejoin; waitForServerEmpty
+				-- keeps running and the character respawns in place.
+				if isHiding or isSwitchingTeam then
+					return
 				end
+				setStepStatus("Died - rejoining...")
+				rejoinSameServer(QUEUE_RESPAWN_HANDLER)
 			end)
 		end
 	end
@@ -299,11 +582,22 @@ local function bindDeathRejoin()
 	charAddedConn = lp.CharacterAdded:Connect(hookCharacter)
 end
 
+--------------------------------------------------------------------------------
+-- HUD / OVERLAY
+--------------------------------------------------------------------------------
+
 local function getStatsHud()
 	local lp = getLocalPlayer()
 	local playerGui = lp:FindFirstChild("PlayerGui")
 	local mainGui = playerGui and playerGui:FindFirstChild("MainGUI")
 	return mainGui and mainGui:FindFirstChild("StatsHUD")
+end
+
+local function getCashAmountLabel()
+	local statsHud = getStatsHud()
+	local cashBagHud = statsHud and statsHud:FindFirstChild("CashBagHUD")
+	local cash = cashBagHud and cashBagHud:FindFirstChild("Cash")
+	return cash and cash:FindFirstChild("Amount")
 end
 
 local function readHudText(pathFn)
@@ -421,69 +715,69 @@ local function createStatsOverlay()
 	end)
 end
 
-local function setTeamToCriminals()
-	local remoteFunc = ReplicatedStorage:FindFirstChild("RemoteFunction") or ReplicatedStorage:WaitForChild("RemoteFunction", 15)
-	if not remoteFunc or not remoteFunc:IsA("RemoteFunction") then
-		warn("ReplicatedStorage.RemoteFunction not found")
+--------------------------------------------------------------------------------
+-- CASH TARGET HELPERS
+--------------------------------------------------------------------------------
+
+local function hasReachedCashTarget(targetText)
+	local label = getCashAmountLabel()
+	if not label or not label:IsA("TextLabel") then
 		return false
 	end
 
-	local ok, err = pcall(function()
-		remoteFunc:InvokeServer("SetTeam", "Criminals")
+	return string.gsub(label.Text, "%s+", "") == targetText
+end
+
+-- Shared farm loop body: waits until cash target reached while handling
+-- death / heist-locked / other-player idling. Returns "target", "timeout" or "fail".
+local function runCashTargetLoop(targetText, failConditionFn)
+	local startClock = os.clock()
+	while not hasReachedCashTarget(targetText) do
+		if (failConditionFn and failConditionFn()) or isPlayerDead() then
+			rejoinSameServer(QUEUE_RESPAWN_HANDLER)
+			return "fail"
+		end
+
+		if hasOtherPlayers() then
+			if not waitForServerEmpty(failConditionFn, "Robbing (" .. targetText .. ")") then
+				return "fail"
+			end
+		end
+
+		if (failConditionFn and failConditionFn()) or isPlayerDead() then
+			rejoinSameServer(QUEUE_RESPAWN_HANDLER)
+			return "fail"
+		end
+
+		if MAX_FARM_SECONDS and (os.clock() - startClock) >= MAX_FARM_SECONDS then
+			warn("Reached MAX_FARM_SECONDS waiting for " .. targetText)
+			return "timeout"
+		end
+
+		task.wait(0.2)
+	end
+	return "target"
+end
+
+-- Shared noclip pump: keeps noclip on only while solo, alive and heist open.
+local function startNoclipPump(failConditionFn)
+	return RunService.Stepped:Connect(function()
+		if not hasOtherPlayers() and not isPlayerDead() and not (failConditionFn and failConditionFn()) then
+			setCharacterNoclip(true)
+		end
 	end)
-
-	if not ok then
-		warn("Failed to invoke SetTeam Criminals:", tostring(err))
-		return false
-	end
-
-	return true
 end
 
-local function switchToCriminalsAndRespawn(nextStepLabel)
-	local previousCharacter = getCharacter()
-	setStepStatus("Switching team & respawning...")
-	isSwitchingTeam = true
-	setTeamToCriminals()
-
-	local lp = getLocalPlayer()
-	local deadline = os.clock() + 20
-	local newChar = lp.Character
-
-	if previousCharacter and newChar == previousCharacter then
-		while os.clock() < deadline do
-			newChar = lp.Character
-			if newChar and newChar ~= previousCharacter and newChar.Parent then
-				break
-			end
-			task.wait(0.05)
-		end
+local function stopNoclipPump(conn)
+	if conn then
+		conn:Disconnect()
 	end
-
-	while os.clock() < deadline do
-		newChar = lp.Character
-		if newChar and newChar.Parent then
-			local hum = newChar:FindFirstChildOfClass("Humanoid")
-			local root = newChar:FindFirstChild("HumanoidRootPart")
-			if hum and root and hum.Health > 0 then
-				isSwitchingTeam = false
-				bindDeathRejoin()
-				if nextStepLabel then
-					setStepStatus(nextStepLabel)
-				end
-				return newChar
-			end
-		end
-		task.wait(0.05)
-	end
-
-	isSwitchingTeam = false
-	bindDeathRejoin()
-	if nextStepLabel then
-		setStepStatus(nextStepLabel)
-	end
-	return lp.Character
+	setCharacterNoclip(false)
 end
+
+--------------------------------------------------------------------------------
+-- JEWELRY HEIST
+--------------------------------------------------------------------------------
 
 local function getInstancePosition(target)
 	if not target then
@@ -503,104 +797,6 @@ local function getInstancePosition(target)
 
 	local part = target:FindFirstChildWhichIsA("BasePart", true)
 	return part and part.Position
-end
-
-local function setCharacterNoclip(enabled)
-	local character = getCharacter()
-	if not character then
-		return
-	end
-
-	for _, desc in ipairs(character:GetDescendants()) do
-		if desc:IsA("BasePart") then
-			desc.CanCollide = not enabled
-		end
-	end
-end
-
-local function tweenCharacterToPosition(destination, speed, failConditionFn)
-	if not guardSoloServer(failConditionFn) then
-		return false
-	end
-
-	speed = math.max(speed or BOX_TWEEN_SPEED, 1)
-	local primary = getRoot()
-	if not primary then
-		return false
-	end
-
-	local startPos = primary.Position
-	local distance = (destination - startPos).Magnitude
-	if distance < 0.5 then
-		return true
-	end
-
-	local duration = distance / speed
-	local lookDir = (destination - startPos).Unit
-	local flatDir = Vector3.new(lookDir.X, 0, lookDir.Z)
-	local goalCFrame = flatDir.Magnitude > 0.001
-		and CFrame.lookAt(destination, destination + flatDir)
-		or CFrame.new(destination)
-
-	local proxy = Instance.new("CFrameValue")
-	proxy.Value = primary.CFrame
-
-	local paused = false
-	local conn = proxy.Changed:Connect(function(newCFrame)
-		if (failConditionFn and failConditionFn()) or isPlayerDead() then
-			rejoinSameServer(QUEUE_RESPAWN_HANDLER)
-			return
-		end
-
-		if hasOtherPlayers() then
-			paused = true
-			return
-		end
-
-		paused = false
-		local character = getCharacter()
-		if character then
-			character:PivotTo(newCFrame)
-		end
-	end)
-
-	local tween = TweenService:Create(
-		proxy,
-		TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out),
-		{ Value = goalCFrame }
-	)
-
-	tween:Play()
-	while tween.PlaybackState == Enum.PlaybackState.Playing do
-		if (failConditionFn and failConditionFn()) or isPlayerDead() then
-			tween:Cancel()
-			conn:Disconnect()
-			proxy:Destroy()
-			rejoinSameServer(QUEUE_RESPAWN_HANDLER)
-			return false
-		end
-
-		if hasOtherPlayers() then
-			tween:Pause()
-			while hasOtherPlayers() and not isPlayerDead() and not (failConditionFn and failConditionFn()) do
-				task.wait(0.2)
-			end
-			if (failConditionFn and failConditionFn()) or isPlayerDead() then
-				tween:Cancel()
-				conn:Disconnect()
-				proxy:Destroy()
-				rejoinSameServer(QUEUE_RESPAWN_HANDLER)
-				return false
-			end
-			tween:Play()
-		end
-
-		RunService.Heartbeat:Wait()
-	end
-
-	conn:Disconnect()
-	proxy:Destroy()
-	return not paused and not isPlayerDead() and not (failConditionFn and failConditionFn())
 end
 
 local function findProximityPrompt(container)
@@ -660,25 +856,6 @@ local function fireVentTouchAndPrompt()
 	end
 
 	return false
-end
-
-local function getCashAmountLabel()
-	local lp = getLocalPlayer()
-	local playerGui = lp:FindFirstChild("PlayerGui")
-	local mainGui = playerGui and playerGui:FindFirstChild("MainGUI")
-	local statsHud = mainGui and mainGui:FindFirstChild("StatsHUD")
-	local cashBagHud = statsHud and statsHud:FindFirstChild("CashBagHUD")
-	local cash = cashBagHud and cashBagHud:FindFirstChild("Cash")
-	return cash and cash:FindFirstChild("Amount")
-end
-
-local function hasReachedCashTarget(targetText)
-	local label = getCashAmountLabel()
-	if not label or not label:IsA("TextLabel") then
-		return false
-	end
-
-	return string.gsub(label.Text, "%s+", "") == targetText
 end
 
 local function isJewelryBox(instance, jewelryBoxesFolder)
@@ -752,31 +929,24 @@ local function runJewelryBoxFarmUntilTargetCash()
 	local boxes = collectAllJewelryBoxes(jewelryBoxesFolder)
 	local startClock = os.clock()
 	local nextIndex = 1
+	local noclipConn = startNoclipPump(isJewelLocked)
 
-	local noclipConn = RunService.Stepped:Connect(function()
-		if not hasOtherPlayers() and not isPlayerDead() and not isJewelLocked() then
-			setCharacterNoclip(true)
-		end
-	end)
+	isMidHeist = true
 
 	while not hasReachedCashTarget(JEWEL_TARGET_CASH) do
 		if isJewelLocked() or isPlayerDead() then
-			noclipConn:Disconnect()
+			isMidHeist = false
+			stopNoclipPump(noclipConn)
 			rejoinSameServer(QUEUE_RESPAWN_HANDLER)
 			return false
 		end
 
 		if hasOtherPlayers() then
-			setStepStatus("Waiting (other player in server)")
-			while hasOtherPlayers() and not isPlayerDead() and not isJewelLocked() do
-				task.wait(0.25)
-			end
-			if isJewelLocked() or isPlayerDead() then
-				noclipConn:Disconnect()
-				rejoinSameServer(QUEUE_RESPAWN_HANDLER)
+			if not waitForServerEmpty(isJewelLocked, "Robbing Jewelry (" .. JEWEL_TARGET_CASH .. ")") then
+				isMidHeist = false
+				stopNoclipPump(noclipConn)
 				return false
 			end
-			setStepStatus("Robbing Jewelry (" .. JEWEL_TARGET_CASH .. ")")
 		end
 
 		if MAX_FARM_SECONDS and (os.clock() - startClock) >= MAX_FARM_SECONDS then
@@ -797,7 +967,8 @@ local function runJewelryBoxFarmUntilTargetCash()
 		end
 
 		if isJewelLocked() or isPlayerDead() then
-			noclipConn:Disconnect()
+			isMidHeist = false
+			stopNoclipPump(noclipConn)
 			rejoinSameServer(QUEUE_RESPAWN_HANDLER)
 			return false
 		end
@@ -813,10 +984,14 @@ local function runJewelryBoxFarmUntilTargetCash()
 		RunService.Heartbeat:Wait()
 	end
 
-	noclipConn:Disconnect()
-	setCharacterNoclip(false)
+	isMidHeist = false
+	stopNoclipPump(noclipConn)
 	return not isPlayerDead() and not isJewelLocked()
 end
+
+--------------------------------------------------------------------------------
+-- CASINO HEIST
+--------------------------------------------------------------------------------
 
 local function collectCasinoLeverEvents()
 	local events = {}
@@ -893,38 +1068,31 @@ local function runCasinoFarmUntilTargetCash()
 	fireAllCasinoLeversOnce(leverEvents)
 
 	local startClock = os.clock()
-	local nextLeverFireClock = os.clock() + 1.5
+	local nextLeverFireClock = os.clock() + LEVER_REFIRE_INTERVAL
+	local noclipConn = startNoclipPump(isCasinoLocked)
 
-	local noclipConn = RunService.Stepped:Connect(function()
-		if not hasOtherPlayers() and not isPlayerDead() and not isCasinoLocked() then
-			setCharacterNoclip(true)
-		end
-	end)
+	isMidHeist = true
 
 	while not hasReachedCashTarget(CASINO_TARGET_CASH) do
 		if isCasinoLocked() or isPlayerDead() then
-			noclipConn:Disconnect()
+			isMidHeist = false
+			stopNoclipPump(noclipConn)
 			rejoinSameServer(QUEUE_RESPAWN_HANDLER)
 			return false
 		end
 
 		if hasOtherPlayers() then
-			setStepStatus("Waiting (other player in server)")
-			while hasOtherPlayers() and not isPlayerDead() and not isCasinoLocked() do
-				task.wait(0.25)
-			end
-			if isCasinoLocked() or isPlayerDead() then
-				noclipConn:Disconnect()
-				rejoinSameServer(QUEUE_RESPAWN_HANDLER)
+			if not waitForServerEmpty(isCasinoLocked, "Robbing Casino (" .. CASINO_TARGET_CASH .. ")") then
+				isMidHeist = false
+				stopNoclipPump(noclipConn)
 				return false
 			end
-			setStepStatus("Robbing Casino (" .. CASINO_TARGET_CASH .. ")")
 		end
 
 		if os.clock() >= nextLeverFireClock then
 			leverEvents = collectCasinoLeverEvents()
 			fireAllCasinoLeversOnce(leverEvents)
-			nextLeverFireClock = os.clock() + 1.5
+			nextLeverFireClock = os.clock() + LEVER_REFIRE_INTERVAL
 		end
 
 		if MAX_FARM_SECONDS and (os.clock() - startClock) >= MAX_FARM_SECONDS then
@@ -935,90 +1103,77 @@ local function runCasinoFarmUntilTargetCash()
 		task.wait(0.2)
 	end
 
-	noclipConn:Disconnect()
-	setCharacterNoclip(false)
+	isMidHeist = false
+	stopNoclipPump(noclipConn)
 	return not isPlayerDead() and not isCasinoLocked()
 end
+
+--------------------------------------------------------------------------------
+-- GENERIC HEIST (Club / Bank: arrive + wait for cash)
+--------------------------------------------------------------------------------
 
 local function waitUntilHeistCashTarget(targetText, failConditionFn, robbingStepLabel)
 	if failConditionFn and not guardHeistCondition(failConditionFn) then
 		return false
 	end
 
-	local activeLabel = robbingStepLabel or ("Robbing (" .. targetText .. ")")
-	setStepStatus(activeLabel)
+	setStepStatus(robbingStepLabel or ("Robbing (" .. targetText .. ")"))
+	local noclipConn = startNoclipPump(failConditionFn)
 
-	local startClock = os.clock()
-	local noclipConn = RunService.Stepped:Connect(function()
-		if not hasOtherPlayers() and not isPlayerDead() and not (failConditionFn and failConditionFn()) then
-			setCharacterNoclip(true)
-		end
-	end)
+	isMidHeist = true
+	local outcome = runCashTargetLoop(targetText, failConditionFn)
+	isMidHeist = false
 
-	while not hasReachedCashTarget(targetText) do
-		if (failConditionFn and failConditionFn()) or isPlayerDead() then
-			noclipConn:Disconnect()
-			rejoinSameServer(QUEUE_RESPAWN_HANDLER)
-			return false
-		end
+	stopNoclipPump(noclipConn)
 
-		if hasOtherPlayers() then
-			setStepStatus("Waiting (other player in server)")
-			while hasOtherPlayers() and not isPlayerDead() and not (failConditionFn and failConditionFn()) do
-				task.wait(0.25)
-			end
-			if (failConditionFn and failConditionFn()) or isPlayerDead() then
-				noclipConn:Disconnect()
-				rejoinSameServer(QUEUE_RESPAWN_HANDLER)
-				return false
-			end
-			setStepStatus(activeLabel)
-		end
-
-		if MAX_FARM_SECONDS and (os.clock() - startClock) >= MAX_FARM_SECONDS then
-			warn("Reached MAX_FARM_SECONDS waiting for " .. targetText)
-			break
-		end
-
-		task.wait(0.2)
+	if outcome == "fail" then
+		return false
 	end
-
-	noclipConn:Disconnect()
-	setCharacterNoclip(false)
 	return not isPlayerDead() and not (failConditionFn and failConditionFn())
 end
 
-local function pivotCharacterToCFrame(targetCFrame, failConditionFn, stepLabel)
-	if stepLabel then
-		setStepStatus(stepLabel)
-	end
+--------------------------------------------------------------------------------
+-- MAIN SEQUENCE
+--------------------------------------------------------------------------------
 
-	if not guardSoloServer(failConditionFn) then
+-- Teleport to FINAL_CFRAME, wait, and mark the heist as collected.
+local function collectCashAtFinalPosition(stepLabel)
+	if not pivotCharacterToCFrame(FINAL_CFRAME, nil, stepLabel) then
 		return false
 	end
-
-	local character = getCharacter()
-	if not character then
-		warn("Character not found for teleport")
+	if not waitGuardedSeconds(COLLECT_WAIT_SECONDS, nil, stepLabel) then
 		return false
 	end
-
-	character:PivotTo(targetCFrame)
+	isMidHeist = false
 	return true
 end
 
-local function waitGuardedSeconds(seconds, failConditionFn, waitStepLabel)
-	if waitStepLabel then
-		setStepStatus(waitStepLabel)
+--[[
+	tp(destination, lockedChecker, stepLabel)
+	Main travel method: the SetTeam call is almost always followed by an immediate
+	teleport to the heist destination, so this bundles the full pattern:
+	guard -> switch to Criminals (respawn) -> guard -> noclip -> pivot -> noclip off.
+	Marks the run as mid-heist on success.
+]]
+local function tp(destination, lockedChecker, stepLabel)
+	if not guardSoloServer(lockedChecker) then
+		return false
 	end
 
-	local deadline = os.clock() + seconds
-	while os.clock() < deadline do
-		if not guardSoloServer(failConditionFn) then
-			return false
-		end
-		task.wait(0.1)
+	switchToCriminalsAndRespawn(stepLabel)
+	if not guardSoloServer(lockedChecker) then
+		return false
 	end
+
+	setCharacterNoclip(true)
+	local ok = pivotCharacterToCFrame(CFrame.new(destination), lockedChecker, stepLabel)
+	setCharacterNoclip(false)
+
+	if not ok then
+		return false
+	end
+
+	isMidHeist = true
 	return true
 end
 
@@ -1031,120 +1186,69 @@ local function executeFullSequence()
 		return
 	end
 
-	-- 1. Switch to Criminals and immediately TP to Jewelry vent top
-	switchToCriminalsAndRespawn("Teleporting to Jewelry...")
-	if not guardSoloServer(isJewelLocked) then
+	-- 1. Switch to Criminals and TP to Jewelry vent top
+	if not tp(VENT_DESTINATION, isJewelLocked, "Teleporting to Jewelry...") then
 		return
 	end
 
 	setCharacterNoclip(true)
-	if not pivotCharacterToCFrame(CFrame.new(VENT_DESTINATION), isJewelLocked, "Teleporting to Jewelry...") then
-		return
-	end
-
 	if not fireVentTouchAndPrompt() then
+		isMidHeist = false
 		return
 	end
 
 	setCharacterNoclip(false)
 	if not waitGuardedSeconds(VENT_WAIT_SECONDS, isJewelLocked, "Waiting at Jewelry vent...") then
+		isMidHeist = false
 		return
 	end
 
-	-- 2. Farm Jewelry until $5000
+	-- 2. Farm Jewelry until target cash
 	if not runJewelryBoxFarmUntilTargetCash() then
 		return
 	end
 
 	-- 3. Collect Jewelry cash at final position
-	if not pivotCharacterToCFrame(FINAL_CFRAME, nil, "Collecting Jewelry cash...") then
-		return
-	end
-	if not waitGuardedSeconds(COLLECT_WAIT_SECONDS, nil, "Collecting Jewelry cash...") then
+	if not collectCashAtFinalPosition("Collecting Jewelry cash...") then
 		return
 	end
 
-	-- 4. Verify Club is open (Locked == false), switch team, and immediately TP to 1328, 146, -127
-	if not guardSoloServer(isClubLocked) then
+	-- 4. Club
+	if not tp(CLUB_DESTINATION, isClubLocked, "Teleporting to Club...") then
 		return
 	end
 
-	switchToCriminalsAndRespawn("Teleporting to Club...")
-	if not guardSoloServer(isClubLocked) then
-		return
-	end
-
-	setCharacterNoclip(true)
-	if not pivotCharacterToCFrame(CFrame.new(CLUB_DESTINATION), isClubLocked, "Teleporting to Club...") then
-		return
-	end
-	setCharacterNoclip(false)
-
-	-- 5. Wait until cash reaches $6000 and collect at final position
+	-- 5. Wait for Club cash and collect
 	if not waitUntilHeistCashTarget(CLUB_TARGET_CASH, isClubLocked, "Robbing Club (" .. CLUB_TARGET_CASH .. ")") then
 		return
 	end
-
-	if not pivotCharacterToCFrame(FINAL_CFRAME, nil, "Collecting Club cash...") then
-		return
-	end
-	if not waitGuardedSeconds(COLLECT_WAIT_SECONDS, nil, "Collecting Club cash...") then
+	if not collectCashAtFinalPosition("Collecting Club cash...") then
 		return
 	end
 
-	-- 6. Verify Casino is open (Locked == false), switch team, and immediately TP to 1655, 26, 524
-	if not guardSoloServer(isCasinoLocked) then
+	-- 6. Casino
+	if not tp(CASINO_DESTINATION, isCasinoLocked, "Teleporting to Casino...") then
 		return
 	end
 
-	switchToCriminalsAndRespawn("Teleporting to Casino...")
-	if not guardSoloServer(isCasinoLocked) then
-		return
-	end
-
-	setCharacterNoclip(true)
-	if not pivotCharacterToCFrame(CFrame.new(CASINO_DESTINATION), isCasinoLocked, "Teleporting to Casino...") then
-		return
-	end
-	setCharacterNoclip(false)
-
-	-- 7. Fire all 4 Casino levers, wait until cash reaches $4000, and collect at final position
+	-- 7. Fire levers, wait for Casino cash, collect
 	if not runCasinoFarmUntilTargetCash() then
 		return
 	end
-
-	if not pivotCharacterToCFrame(FINAL_CFRAME, nil, "Collecting Casino cash...") then
-		return
-	end
-	if not waitGuardedSeconds(COLLECT_WAIT_SECONDS, nil, "Collecting Casino cash...") then
+	if not collectCashAtFinalPosition("Collecting Casino cash...") then
 		return
 	end
 
-	-- 8. Verify Bank is open (Locked == false), switch team, and immediately TP to 763, 1, 479
-	if not guardSoloServer(isBankLocked) then
+	-- 8. Bank
+	if not tp(BANK_DESTINATION, isBankLocked, "Teleporting to Bank...") then
 		return
 	end
 
-	switchToCriminalsAndRespawn("Teleporting to Bank...")
-	if not guardSoloServer(isBankLocked) then
-		return
-	end
-
-	setCharacterNoclip(true)
-	if not pivotCharacterToCFrame(CFrame.new(BANK_DESTINATION), isBankLocked, "Teleporting to Bank...") then
-		return
-	end
-	setCharacterNoclip(false)
-
-	-- 9. Wait until cash reaches $3000, collect at final position, and rejoin
+	-- 9. Wait for Bank cash, collect, then rejoin for a fresh run
 	if not waitUntilHeistCashTarget(BANK_TARGET_CASH, isBankLocked, "Robbing Bank (" .. BANK_TARGET_CASH .. ")") then
 		return
 	end
-
-	if not pivotCharacterToCFrame(FINAL_CFRAME, nil, "Collecting Bank cash...") then
-		return
-	end
-	if not waitGuardedSeconds(COLLECT_WAIT_SECONDS, nil, "Collecting Bank cash...") then
+	if not collectCashAtFinalPosition("Collecting Bank cash...") then
 		return
 	end
 
@@ -1152,5 +1256,7 @@ local function executeFullSequence()
 		rejoinSameServer(QUEUE_RESPAWN_HANDLER)
 	end
 end
+
+queue_on_teleport('loadstring(game:HttpGet("https://raw.githubusercontent.com/LuaSecurity/Mad-City/refs/heads/main/ccc"))()')
 
 executeFullSequence()
