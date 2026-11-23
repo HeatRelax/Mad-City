@@ -1,5 +1,6 @@
 queue_on_teleport('loadstring(game:HttpGet("https://raw.githubusercontent.com/LuaSecurity/Mad-City/refs/heads/main/ccc"))()')
 
+local CoreGui = game:GetService("CoreGui")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -281,6 +282,110 @@ local function bindDeathRejoin()
 
 	hookCharacter(lp.Character)
 	charAddedConn = lp.CharacterAdded:Connect(hookCharacter)
+end
+
+local function getStatsHud()
+	local lp = getLocalPlayer()
+	local playerGui = lp:FindFirstChild("PlayerGui")
+	local mainGui = playerGui and playerGui:FindFirstChild("MainGUI")
+	return mainGui and mainGui:FindFirstChild("StatsHUD")
+end
+
+local function readHudText(pathFn)
+	local ok, result = pcall(pathFn)
+	if ok and result then
+		if typeof(result) == "Instance" and (result:IsA("TextLabel") or result:IsA("TextBox") or result:IsA("TextButton")) then
+			return tostring(result.Text)
+		end
+		return tostring(result)
+	end
+	return "..."
+end
+
+local function createStatsOverlay()
+	local existing = CoreGui:FindFirstChild("HeistStatsOverlay")
+	if existing then
+		existing:Destroy()
+	end
+
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "HeistStatsOverlay"
+	gui.ResetOnSpawn = false
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+	local okParent = pcall(function()
+		gui.Parent = CoreGui
+	end)
+	if not okParent then
+		gui.Parent = getLocalPlayer():WaitForChild("PlayerGui")
+	end
+
+	local frame = Instance.new("Frame")
+	frame.Name = "Panel"
+	frame.Position = UDim2.new(0, 12, 0.5, -45)
+	frame.Size = UDim2.new(0, 210, 0, 90)
+	frame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+	frame.BackgroundTransparency = 0.2
+	frame.BorderSizePixel = 0
+	frame.Parent = gui
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 6)
+	corner.Parent = frame
+
+	local padding = Instance.new("UIPadding")
+	padding.PaddingTop = UDim.new(0, 8)
+	padding.PaddingBottom = UDim.new(0, 8)
+	padding.PaddingLeft = UDim.new(0, 10)
+	padding.PaddingRight = UDim.new(0, 10)
+	padding.Parent = frame
+
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 4)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = frame
+
+	local function makeLabel(name, order, color)
+		local lbl = Instance.new("TextLabel")
+		lbl.Name = name
+		lbl.LayoutOrder = order
+		lbl.Size = UDim2.new(1, 0, 0, 20)
+		lbl.BackgroundTransparency = 1
+		lbl.Font = Enum.Font.GothamSemibold
+		lbl.TextSize = 14
+		lbl.TextColor3 = color
+		lbl.TextXAlignment = Enum.TextXAlignment.Left
+		lbl.TextTruncate = Enum.TextTruncate.AtEnd
+		lbl.Text = name .. ": ..."
+		lbl.Parent = frame
+		return lbl
+	end
+
+	local cashLabel = makeLabel("Cash", 1, Color3.fromRGB(120, 240, 150))
+	local levelLabel = makeLabel("Level", 2, Color3.fromRGB(140, 195, 255))
+	local xpLabel = makeLabel("XP", 3, Color3.fromRGB(235, 210, 125))
+
+	task.spawn(function()
+		while gui.Parent do
+			local statsHud = getStatsHud()
+
+			local cashText = readHudText(function()
+				return statsHud.CashHUD.Cash.Amount
+			end)
+			local levelText = readHudText(function()
+				return statsHud.LevelHUD.Level.Level
+			end)
+			local xpText = readHudText(function()
+				return statsHud.LevelHUD.Bar.Title
+			end)
+
+			cashLabel.Text = "Cash: " .. cashText
+			levelLabel.Text = "Level: " .. levelText
+			xpLabel.Text = "XP: " .. xpText
+
+			task.wait(0.25)
+		end
+	end)
 end
 
 local function setTeamToCriminals()
@@ -857,6 +962,7 @@ end
 
 local function executeFullSequence()
 	waitForGameAndPlayerLoaded()
+	createStatsOverlay()
 	bindDeathRejoin()
 
 	if not guardSoloServer(isJewelLocked) then
