@@ -4,9 +4,11 @@
 	- Farms Jewel -> Club -> Casino -> Bank, collecting cash at FINAL_CFRAME between each.
 	- If ANY other player is in the server:
 		* switches team to Criminals,
-		* if a heist is in progress (mid-heist), teleports to FINAL_CFRAME and stays there
-		  completely still doing NOTHING (no rejoin, no farming),
-		* resumes the sequence automatically once the server is solo again.
+	* if a heist is in progress (mid-heist), teleports to FINAL_CFRAME and stays there
+	  completely still doing NOTHING (no rejoin, no farming),
+	* an anti-AFK nudge (VirtualUser) fires periodically while idling so Roblox's
+	  idle kicker never disconnects you during the wait,
+	* resumes the sequence automatically once the server is solo again.
 ]]
 
 --------------------------------------------------------------------------------
@@ -20,6 +22,7 @@ local RunService = game:GetService("RunService")
 local TeleportService = game:GetService("TeleportService")
 local TweenService = game:GetService("TweenService")
 local Workspace = game:GetService("Workspace")
+local VirtualUser = game:GetService("VirtualUser")
 
 local player = Players.LocalPlayer
 
@@ -39,6 +42,7 @@ local COLLECT_WAIT_SECONDS = 1.5
 local LEVER_REFIRE_INTERVAL = 1.5
 local IDLE_CHECK_INTERVAL = 0.25 -- poll rate while other players are present
 local HIDE_SNAP_DISTANCE = 5 -- re-pivot to FINAL_CFRAME if drifted further than this
+local ANTI_AFK_INTERVAL = 60 -- seconds between anti-AFK nudges while idling
 
 -- Targets
 local JEWEL_TARGET_CASH = "$5000"
@@ -289,6 +293,20 @@ end
 -- PLAYER-PRESENCE HANDLER (idling while others are in the server)
 --------------------------------------------------------------------------------
 
+-- Anti-AFK: simulates real input via VirtualUser so Roblox's idle detection
+-- (disconnect after ~20 minutes of no input) never fires during long waits.
+-- This does NOT move the character or fire any game remotes - the character
+-- stays perfectly still at the collect position while we wait.
+local function runAntiAfkNudge()
+	local ok, err = pcall(function()
+		VirtualUser:CaptureController()
+		VirtualUser:ClickButton2(Vector2.new())
+	end)
+	if not ok then
+		warn("Anti-AFK nudge failed:", tostring(err))
+	end
+end
+
 -- Central handler for "someone else is in the server":
 -- 1. switch team to Criminals (once per hide),
 -- 2. if mid-heist, teleport to FINAL_CFRAME and stay perfectly still,
@@ -317,6 +335,9 @@ local function waitForServerEmpty(failConditionFn, resumeLabel)
 	pcall(setTeamToCriminals)
 	task.wait(0.5)
 
+	local idleStartClock = os.clock()
+	local lastAntiAfkClock = os.clock()
+
 	while hasOtherPlayers() do
 		-- While hiding we deliberately ignore heist-lock changes; we simply stay put
 		-- doing nothing until the other player leaves.
@@ -329,6 +350,19 @@ local function waitForServerEmpty(failConditionFn, resumeLabel)
 				end
 			end
 		end
+
+		-- Anti-AFK nudge while waiting (resets Roblox's idle timer without moving us)
+		if (os.clock() - lastAntiAfkClock) >= ANTI_AFK_INTERVAL then
+			runAntiAfkNudge()
+			lastAntiAfkClock = os.clock()
+		end
+
+		-- Live status with elapsed idle time so the overlay shows we are still waiting
+		setStepStatus(string.format(
+			"Player in server - idling (%ds)...",
+			math.floor(os.clock() - idleStartClock)
+		))
+
 		task.wait(IDLE_CHECK_INTERVAL)
 	end
 
