@@ -2,10 +2,10 @@
 	Mad City Auto Robber
 	Entry point. Downloads the maintained source and runs it.
 
-	Source: https://github.com/LuaSecurity/Mad-City
+	Source: https://github.com/LuaSecurity/Perfect/tree/main/Auto%20Robber
 ]]
 
-local mainUrl = "https://raw.githubusercontent.com/LuaSecurity/Mad-City/refs/heads/main/Main.lua"
+local mainUrl = "https://raw.githubusercontent.com/LuaSecurity/Perfect/refs/heads/main/Auto%20Robber/Main.lua"
 
 local function fetchSource(url)
 	local lastError
